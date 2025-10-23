@@ -152,13 +152,12 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     /* sort using sizeof(Record) */
     qsort(buf, count, sizeof(Record), record_cmp);
 
-    /* write directly into final file at the correct offset to avoid creating tmp files + merge */
-    int fd = open(cfg.file_final, O_WRONLY | O_CREAT, 0666);
-    if (fd < 0) { perror("open final"); exit(1); }
-    off_t off = (off_t)start * RECORD_SIZE;
-    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), off);
+    /* write chunk to the temporary file (not directly to final) */
+    int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) { perror("open tmpfile"); close(fd); free(buf); exit(1); }
+    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
     if (wrote < 0) {
-        perror("pwrite final");
+        perror("pwrite tmpfile");
         close(fd);
         free(buf);
         exit(1);
