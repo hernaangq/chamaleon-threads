@@ -248,6 +248,8 @@ static int node_less(const Node *x, const Node *y) {
 }
 
 void merge_chunks() {
+    double m0 = get_time();
+
     int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_out < 0) { perror("open final"); exit(1); }
 
@@ -266,50 +268,97 @@ void merge_chunks() {
 
     if (nfiles == 0) { close(fd_out); free(fps); free(indices); return; }
 
-    /* simple binary min-heap by hash */
-    Node *heap = malloc(nfiles * sizeof(Node));
-    int heap_sz = 0;
+    /* per-file read buffer */
+    const size_t IN_RECS = 4096;   /* tune: number of records to read per fread */
+    typedef struct {
+        FILE *f;
+        Record *buf;
+        size_t len; /* valid records in buf */
+        size_t pos; /* next index to consume */
+        int idx;    /* file index (for removal naming) */
+    } FileBuf;
 
-    /* push initial record from each file */
+    FileBuf *fb = calloc(nfiles, sizeof(FileBuf));
     for (int i = 0; i < nfiles; i++) {
-        if (fread(&heap[heap_sz].rec, sizeof(Record), 1, fps[i]) != 1) {
-            fclose(fps[i]);
-            fps[i] = NULL;
-            continue;
-        }
-        heap[heap_sz].src = i;
-        /* sift up */
-        int ci = heap_sz++;
-        while (ci > 0) {
-            int pi = (ci - 1) >> 1;
-            if (!node_less(&heap[ci], &heap[pi])) break;
-            heap_swap(&heap[ci], &heap[pi]);
-            ci = pi;
+        fb[i].f = fps[i];
+        fb[i].buf = malloc(IN_RECS * sizeof(Record));
+        fb[i].len = fread(fb[i].buf, sizeof(Record), IN_RECS, fb[i].f);
+        fb[i].pos = 0;
+        fb[i].idx = indices[i];
+        if (fb[i].len == 0) { /* empty file */
+            fclose(fb[i].f);
+            fb[i].f = NULL;
         }
     }
 
-    /* merge */
+    /* heap node and helpers already exist at file scope: Node, heap_swap, node_less */
+    Node *heap = malloc(nfiles * sizeof(Node));
+    int heap_sz = 0;
+
+    /* push initial record from each file (from buffer) */
+    for (int i = 0; i < nfiles; i++) {
+        if (!fb[i].f) continue;
+        heap[heap_sz].rec = fb[i].buf[fb[i].pos++];
+        heap[heap_sz].src = i;
+        heap_sz++;
+    }
+    /* heapify by sifting up each inserted element (or build-heap) */
+    for (int ci = 1; ci < heap_sz; ci++) {
+        int cur = ci;
+        while (cur > 0) {
+            int pi = (cur - 1) >> 1;
+            if (!node_less(&heap[cur], &heap[pi])) break;
+            heap_swap(&heap[cur], &heap[pi]);
+            cur = pi;
+        }
+    }
+
+    /* output buffer */
+    const size_t OUT_RECS = 65536; /* large write chunk (tune) */
+    Record *outbuf = malloc(OUT_RECS * sizeof(Record));
+    size_t out_cnt = 0;
+
+    /* merge loop */
     while (heap_sz > 0) {
-        /* pop min (root) */
         Node top = heap[0];
-        /* write top.rec to output */
-        const char *p = (const char*)&top.rec;
-        size_t remaining = sizeof(Record);
-        while (remaining > 0) {
-            ssize_t w = write(fd_out, p, remaining);
-            if (w < 0) { perror("write final"); goto cleanup; }
-            p += w;
-            remaining -= w;
+        /* append to outbuf */
+        outbuf[out_cnt++] = top.rec;
+        if (out_cnt == OUT_RECS) {
+            /* flush */
+            const char *p = (const char *)outbuf;
+            size_t remaining = out_cnt * sizeof(Record);
+            while (remaining > 0) {
+                ssize_t w = write(fd_out, p, remaining);
+                if (w < 0) { perror("write final"); goto cleanup; }
+                p += w;
+                remaining -= w;
+            }
+            out_cnt = 0;
         }
 
         int src = top.src;
-        /* replace root with next from same source (or remove if EOF) */
-        if (fps[src] && fread(&heap[0].rec, sizeof(Record), 1, fps[src]) == 1) {
+        /* refill from that file buffer if available */
+        if (fb[src].f && fb[src].pos < fb[src].len) {
+            heap[0].rec = fb[src].buf[fb[src].pos++];
             heap[0].src = src;
+        } else if (fb[src].f) {
+            /* buffer exhausted; try to refill */
+            fb[src].len = fread(fb[src].buf, sizeof(Record), IN_RECS, fb[src].f);
+            fb[src].pos = 0;
+            if (fb[src].len > 0) {
+                heap[0].rec = fb[src].buf[fb[src].pos++];
+                heap[0].src = src;
+            } else {
+                /* EOF on this file: close and remove heap root by replacing with last */
+                fclose(fb[src].f);
+                fb[src].f = NULL;
+                heap[0] = heap[--heap_sz];
+            }
         } else {
-            /* remove root by replacing with last element */
+            /* file already closed, should not happen */
             heap[0] = heap[--heap_sz];
         }
+
         /* sift down root */
         int i = 0;
         while (1) {
@@ -324,21 +373,37 @@ void merge_chunks() {
         }
     }
 
-cleanup:
-    /* close and remove tmp files */
-    for (int i = 0; i < nfiles; i++) {
-        if (fps[i]) {
-            fclose(fps[i]);
+    /* flush remaining output */
+    if (out_cnt > 0) {
+        const char *p = (const char *)outbuf;
+        size_t remaining = out_cnt * sizeof(Record);
+        while (remaining > 0) {
+            ssize_t w = write(fd_out, p, remaining);
+            if (w < 0) { perror("write final"); goto cleanup; }
+            p += w;
+            remaining -= w;
         }
-        char tmpfile[256];
-        snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
-        remove(tmpfile);
+        out_cnt = 0;
     }
 
-    close(fd_out);
+cleanup:
+    /* close and remove tmp files and free buffers */
+    for (int i = 0; i < nfiles; i++) {
+        if (fb[i].buf) free(fb[i].buf);
+        if (fb[i].f) fclose(fb[i].f);
+        char tmpfile[256];
+        snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)fb[i].idx);
+        remove(tmpfile);
+    }
+    free(fb);
     free(heap);
+    free(outbuf);
     free(fps);
     free(indices);
+    close(fd_out);
+
+    double m1 = get_time();
+    if (cfg.debug) fprintf(stderr, "merge time=%.3f s\n", m1 - m0);
 }
 
 /* ---------- Generate Mode ---------- */
