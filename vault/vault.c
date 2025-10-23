@@ -166,7 +166,21 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     free(buf);
 }
 
-/* ---------- Merge Chunks ---------- */
+/* ---------- heap node used by merge_chunks (moved to file scope) */
+typedef struct { Record rec; int src; } Node;
+
+/* helper: swap two heap nodes (file-scope) */
+static void heap_swap(Node *a, Node *b) {
+    Node t = *a; *a = *b; *b = t;
+}
+
+/* compare by hash then nonce (file-scope) */
+static int node_less(const Node *x, const Node *y) {
+    int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
+    if (cmp != 0) return cmp < 0;
+    return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
+}
+
 void merge_chunks() {
     int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_out < 0) { perror("open final"); exit(1); }
@@ -185,21 +199,6 @@ void merge_chunks() {
     }
 
     if (nfiles == 0) { close(fd_out); free(fps); free(indices); return; }
-
-    /* heap node */
-    typedef struct { Record rec; int src; } Node;
-
-    /* helper: swap two heap nodes */
-    static void heap_swap(Node *a, Node *b) {
-        Node t = *a; *a = *b; *b = t;
-    }
-
-    /* compare by hash then nonce */
-    static int node_less(const Node *x, const Node *y) {
-        int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
-        if (cmp != 0) return cmp < 0;
-        return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
-    }
 
     /* simple binary min-heap by hash */
     Node *heap = malloc(nfiles * sizeof(Node));
@@ -264,14 +263,10 @@ cleanup:
     for (int i = 0; i < nfiles; i++) {
         if (fps[i]) {
             fclose(fps[i]);
-            char tmpfile[256];
-            snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
-            remove(tmpfile);
-        } else {
-            char tmpfile[256];
-            snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
-            remove(tmpfile);
         }
+        char tmpfile[256];
+        snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
+        remove(tmpfile);
     }
 
     close(fd_out);
