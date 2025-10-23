@@ -189,21 +189,21 @@ void merge_chunks() {
     /* heap node */
     typedef struct { Record rec; int src; } Node;
 
+    /* helper: swap two heap nodes */
+    static void heap_swap(Node *a, Node *b) {
+        Node t = *a; *a = *b; *b = t;
+    }
+
+    /* compare by hash then nonce */
+    static int node_less(const Node *x, const Node *y) {
+        int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
+        if (cmp != 0) return cmp < 0;
+        return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
+    }
+
     /* simple binary min-heap by hash */
     Node *heap = malloc(nfiles * sizeof(Node));
     int heap_sz = 0;
-
-    auto heap_swap = [](Node *a, Node *b) {
-        Node t = *a; *a = *b; *b = t;
-    };
-
-    /* compare by hash */
-    auto node_less = [](const Node *x, const Node *y) {
-        int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
-        if (cmp != 0) return cmp < 0;
-        /* tie-breaker by nonce to get deterministic order */
-        return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
-    };
 
     /* push initial record from each file */
     for (int i = 0; i < nfiles; i++) {
@@ -218,7 +218,7 @@ void merge_chunks() {
         while (ci > 0) {
             int pi = (ci - 1) >> 1;
             if (!node_less(&heap[ci], &heap[pi])) break;
-            Node tmp = heap[ci]; heap[ci] = heap[pi]; heap[pi] = tmp;
+            heap_swap(&heap[ci], &heap[pi]);
             ci = pi;
         }
     }
@@ -254,7 +254,7 @@ void merge_chunks() {
             if (l < heap_sz && node_less(&heap[l], &heap[smallest])) smallest = l;
             if (r < heap_sz && node_less(&heap[r], &heap[smallest])) smallest = r;
             if (smallest == i) break;
-            Node tmp = heap[i]; heap[i] = heap[smallest]; heap[smallest] = tmp;
+            heap_swap(&heap[i], &heap[smallest]);
             i = smallest;
         }
     }
@@ -268,7 +268,6 @@ cleanup:
             snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
             remove(tmpfile);
         } else {
-            /* file was NULL because it couldn't be read initially; still try remove */
             char tmpfile[256];
             snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
             remove(tmpfile);
