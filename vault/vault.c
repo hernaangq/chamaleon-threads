@@ -126,10 +126,14 @@ ssize_t safe_pwrite_all(int fd, const void *buf, size_t size, off_t off) {
 }
 
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
+    double t0 = get_time();
+
     /* allocate records using sizeof(Record) */
     Record *buf = malloc(count * sizeof(Record));
     if (!buf) { perror("malloc"); exit(1); }
 
+    /* Hashing */
+    double th0 = get_time();
     if (!strcmp(cfg.approach, "for")) {
         #pragma omp parallel for num_threads(cfg.threads)
         for (uint64_t i = 0; i < count; i++) {
@@ -148,22 +152,32 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
         for (int t = 0; t < cfg.threads; t++) pthread_join(tids[t], NULL);
         free(tids);
     }
+    double th1 = get_time();
 
-    /* sort using sizeof(Record) */
+    /* Sort */
+    double ts0 = get_time();
     qsort(buf, count, sizeof(Record), record_cmp);
+    double ts1 = get_time();
 
     /* write chunk to the temporary file (not directly to final) */
+    double tw0 = get_time();
     int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) { perror("open tmpfile"); close(fd); free(buf); exit(1); }
+    if (fd < 0) { perror("open tmpfile"); free(buf); exit(1); }
     ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
     if (wrote < 0) {
         perror("pwrite tmpfile");
-        close(fd);
-        free(buf);
-        exit(1);
+        close(fd); free(buf); exit(1);
     }
     close(fd);
+    double tw1 = get_time();
+
     free(buf);
+    double t1 = get_time();
+
+    if (cfg.debug) {
+        fprintf(stderr, "chunk start=%" PRIu64 " count=%" PRIu64 " times: hash=%.3f s sort=%.3f s write=%.3f s total=%.3f s\n",
+                start, count, th1 - th0, ts1 - ts0, tw1 - tw0, t1 - t0);
+    }
 }
 
 /* ---------- heap node used by merge_chunks (moved to file scope) */
