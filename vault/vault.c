@@ -112,8 +112,22 @@ void *hash_worker(void *arg) {
 }
 
 /* ---------- Generate + Sort + Write Chunk ---------- */
+ssize_t safe_pwrite_all(int fd, const void *buf, size_t size, off_t off) {
+    const char *p = buf;
+    size_t remaining = size;
+    while (remaining > 0) {
+        ssize_t w = pwrite(fd, p, remaining, off);
+        if (w < 0) return -1;
+        p += w;
+        off += w;
+        remaining -= w;
+    }
+    return (ssize_t)size;
+}
+
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
-    Record *buf = malloc(count * RECORD_SIZE);
+    /* allocate records using sizeof(Record) */
+    Record *buf = malloc(count * sizeof(Record));
     if (!buf) { perror("malloc"); exit(1); }
 
     if (!strcmp(cfg.approach, "for")) {
@@ -126,35 +140,29 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
         pthread_t *tids = malloc(cfg.threads * sizeof(pthread_t));
         for (int t = 0; t < cfg.threads; t++) {
             uint64_t s = start + t * per_thread;
-            uint64_t e = (t == cfg.threads - 1) ? count : (t + 1) * per_thread;
+            uint64_t e = (t == cfg.threads - 1) ? (start + count) : (start + (t + 1) * per_thread);
             HashTask *task = malloc(sizeof(HashTask));
-            task->start = s; task->count = e - s; task->buf = buf + s;
+            task->start = s; task->count = e - s; task->buf = buf + (s - start);
             pthread_create(&tids[t], NULL, hash_worker, task);
         }
         for (int t = 0; t < cfg.threads; t++) pthread_join(tids[t], NULL);
         free(tids);
     }
 
-    qsort(buf, count, RECORD_SIZE, record_cmp);
+    /* sort using sizeof(Record) */
+    qsort(buf, count, sizeof(Record), record_cmp);
 
-    int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) { perror("open"); exit(1); }
-
-    uint64_t per_io = count / cfg.iothreads;
-    pthread_t *io_tids = malloc(cfg.iothreads * sizeof(pthread_t));
-    for (int t = 0; t < cfg.iothreads; t++) {
-        uint64_t s = t * per_io;
-        uint64_t e = (t == cfg.iothreads - 1) ? count : (t + 1) * per_io;
-        size_t size = (e - s) * RECORD_SIZE;
-        off_t off = s * RECORD_SIZE;
-        char *data = malloc(size);
-        memcpy(data, (char*)buf + s * RECORD_SIZE, size);
-        WriteJob *job = malloc(sizeof(WriteJob));
-        job->fd = fd; job->off = off; job->buf = data; job->size = size;
-        pthread_create(&io_tids[t], NULL, write_worker, job);
+    /* write directly into final file at the correct offset to avoid creating tmp files + merge */
+    int fd = open(cfg.file_final, O_WRONLY | O_CREAT, 0666);
+    if (fd < 0) { perror("open final"); exit(1); }
+    off_t off = (off_t)start * RECORD_SIZE;
+    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), off);
+    if (wrote < 0) {
+        perror("pwrite final");
+        close(fd);
+        free(buf);
+        exit(1);
     }
-    for (int t = 0; t < cfg.iothreads; t++) pthread_join(io_tids[t], NULL);
-    free(io_tids);
     close(fd);
     free(buf);
 }
