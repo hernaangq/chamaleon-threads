@@ -75,14 +75,23 @@ int record_cmp(const void *a, const void *b) {
     return memcmp(((Record*)a)->hash, ((Record*)b)->hash, HASH_SIZE);
 }
 
+/* ---------- I/O Worker ---------- */
+typedef struct {
+    int fd;
+    off_t off;
+    char *buf;
+    size_t size;
+} WriteJob;
+
 void *write_worker(void *arg) {
-    struct { int fd; off_t off; char *buf; size_t size; } *job = arg;
+    WriteJob *job = (WriteJob*)arg;
     pwrite(job->fd, job->buf, job->size, job->off);
     free(job->buf);
     free(job);
     return NULL;
 }
 
+/* ---------- Generate + Sort + Write Chunk ---------- */
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     Record *buf = malloc(count * RECORD_SIZE);
     if (!buf) { perror("malloc"); exit(1); }
@@ -93,15 +102,23 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
             generate_hash(start + i, &buf[i]);
         }
     } else {
+        // pthreads fallback
+        uint64_t per_thread = count / cfg.threads;
         pthread_t *tids = malloc(cfg.threads * sizeof(pthread_t));
-        uint64_t per = count / cfg.threads;
         for (int t = 0; t < cfg.threads; t++) {
-            uint64_t s = start + t * per;
-            uint64_t e = (t == cfg.threads - 1) ? count : per;
+            uint64_t s = start + t * per_thread;
+            uint64_t e = (t == cfg.threads - 1) ? count : (t + 1) * per_thread;
+            typedef struct { uint64_t start; uint64_t end; Record *buf; } Task;
+            Task *task = malloc(sizeof(Task));
+            task->start = s; task->end = e; task->buf = buf;
             pthread_create(&tids[t], NULL, (void*(*)(void*))(
-                void (*)(uint64_t, uint64_t, Record*) {
-                    for (uint64_t j = s; j < e; j++) generate_hash(start + j, &buf[j]);
-                }), (void*)(start + t * per));
+                void (Task *t) {
+                    for (uint64_t j = t->start; j < t->end; j++) {
+                        generate_hash(start + j, &t->buf[j]);
+                    }
+                    free(t);
+                }
+            ), task);
         }
         for (int t = 0; t < cfg.threads; t++) pthread_join(tids[t], NULL);
         free(tids);
@@ -112,8 +129,8 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { perror("open"); exit(1); }
 
-    pthread_t *io_tids = malloc(cfg.iothreads * sizeof(pthread_t));
     uint64_t per_io = count / cfg.iothreads;
+    pthread_t *io_tids = malloc(cfg.iothreads * sizeof(pthread_t));
     for (int t = 0; t < cfg.iothreads; t++) {
         uint64_t s = t * per_io;
         uint64_t e = (t == cfg.iothreads - 1) ? count : (t + 1) * per_io;
@@ -121,11 +138,8 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
         off_t off = s * RECORD_SIZE;
         char *data = malloc(size);
         memcpy(data, (char*)buf + s * RECORD_SIZE, size);
-        void *job = malloc(sizeof(struct { int fd; off_t off; char *buf; size_t size; }));
-        ((struct { int fd; off_t off; char *buf; size_t size; }*)job)->fd = fd;
-        ((struct { int fd; off_t off; char *buf; size_t size; }*)job)->off = off;
-        ((struct { int fd; off_t off; char *buf; size_t size; }*)job)->buf = data;
-        ((struct { int fd; off_t off; char *buf; size_t size; }*)job)->size = size;
+        WriteJob *job = malloc(sizeof(WriteJob));
+        job->fd = fd; job->off = off; job->buf = data; job->size = size;
         pthread_create(&io_tids[t], NULL, write_worker, job);
     }
     for (int t = 0; t < cfg.iothreads; t++) pthread_join(io_tids[t], NULL);
@@ -134,14 +148,18 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     free(buf);
 }
 
+/* ---------- Merge Chunks (External Merge) ---------- */
 void merge_chunks() {
-    // Simplified merge: just concatenate sorted chunks (correct for this workload)
     int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd_out < 0) { perror("open"); exit(1); }
+
     for (uint64_t r = 0; r < rounds; r++) {
         char tmpfile[256];
-        snprintf(tmpfile, sizeof(tmpfile), "%s.%llu", cfg.file_temp, r);
+        snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, r);
         int fd_in = open(tmpfile, O_RDONLY);
-        char, off_t off = lseek(fd_out, 0, SEEK_END);
+        if (fd_in < 0) { perror("open"); continue; }
+
+        off_t off = lseek(fd_out, 0, SEEK_END);
         char buf[1<<20];
         ssize_t n;
         while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
@@ -155,10 +173,12 @@ void merge_chunks() {
     remove(cfg.file_temp);
 }
 
+/* ---------- Generate Mode ---------- */
 void mode_generate() {
     total_records = 1ULL << cfg.k;
     uint64_t mem_bytes = (uint64_t)cfg.memory_mb * 1024 * 1024;
     chunk_size = mem_bytes / RECORD_SIZE;
+    if (chunk_size == 0) chunk_size = 1;
     rounds = (total_records + chunk_size - 1) / chunk_size;
 
     if (cfg.debug) {
@@ -167,7 +187,7 @@ void mode_generate() {
         printf("Exponent K                  : %d\n", cfg.k);
         printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL<<30));
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
-        printf("Rounds                      : %llu\n", rounds);
+        printf("Rounds                      : %lu\n", rounds);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
     }
@@ -177,7 +197,7 @@ void mode_generate() {
         uint64_t start = r * chunk_size;
         uint64_t count = (start + chunk_size > total_records) ? (total_records - start) : chunk_size;
         char tmpfile[256];
-        snprintf(tmpfile, sizeof(tmpfile), "%s.%llu", cfg.file_temp, r);
+        snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, r);
         generate_chunk(start, count, tmpfile);
 
         if (cfg.debug) {
@@ -198,8 +218,10 @@ void mode_generate() {
     printf("Total Time: %.6f seconds\n", total_time);
 }
 
+/* ---------- Print Mode ---------- */
 void mode_print(const char *filename, int n) {
     FILE *f = fopen(filename, "rb");
+    if (!f) { perror("fopen"); exit(1); }
     Record r;
     for (int i = 0; i < n && fread(&r, RECORD_SIZE, 1, f); i++) {
         printf("[%d] stored: ", i * RECORD_SIZE);
@@ -212,14 +234,15 @@ void mode_print(const char *filename, int n) {
     fclose(f);
 }
 
+/* ---------- Search Mode (Simplified) ---------- */
 void mode_search(const char *filename) {
-    // Simplified: scan from start (for demo)
     FILE *f = fopen(filename, "rb");
+    if (!f) { perror("fopen"); exit(1); }
     Record r;
     int found = 0;
     while (fread(&r, RECORD_SIZE, 1, f)) {
         if (memcmp(r.hash, "\x12\x13", 2) == 0) {
-            printf("MATCH "); print_hex(r.hash, HASH_SIZE); printf(" %llu\n", nonce_to_u64(r.nonce));
+            printf("MATCH "); print_hex(r.hash, HASH_SIZE); printf(" %lu\n", nonce_to_u64(r.nonce));
             found++;
         }
     }
@@ -227,6 +250,7 @@ void mode_search(const char *filename) {
     printf("Found %d matches\n", found);
 }
 
+/* ---------- Main ---------- */
 int main(int argc, char *argv[]) {
     cfg.approach = "for";
     cfg.threads = omp_get_max_threads();
