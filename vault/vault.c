@@ -208,7 +208,7 @@ void mode_generate() {
         printf("Exponent K                  : %d\n", cfg.k);
         printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL<<30));
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
-        printf("Rounds                      : %lu\n", rounds);
+    printf("Rounds                      : %" PRIu64 "\n", rounds);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
     }
@@ -260,10 +260,10 @@ void mode_search(const char *filename) {
     printf("Record Size                  : %d\n", RECORD_SIZE);
     printf("Hash Size                    : %d\n", HASH_SIZE);
     printf("On-disk Record Size          : %d\n", RECORD_SIZE);
-    printf("Number of Buckets            : %llu\n", 1ULL << 24);
-    printf("Number of Records in Bucket  : %llu\n", 1ULL << (cfg.k - 24));
-    printf("Number of Hashes             : %llu\n", total_records);
-    printf("File Size to be read (bytes) : %llu\n", total_records * RECORD_SIZE);
+    printf("Number of Buckets            : %" PRIu64 "\n", (uint64_t)(1ULL << 24));
+    printf("Number of Records in Bucket  : %" PRIu64 "\n", (uint64_t)(1ULL << (cfg.k - 24)) );
+    printf("Number of Hashes             : %" PRIu64 "\n", total_records);
+    printf("File Size to be read (bytes) : %" PRIu64 "\n", (uint64_t)(total_records * RECORD_SIZE));
     printf("File Size to be read (GB)    : %.6f\n", (double)(total_records * RECORD_SIZE) / (1ULL << 30));
     printf("Actual file size on disk     : %lld bytes\n", (long long)st.st_size);
 
@@ -289,7 +289,7 @@ void mode_search(const char *filename) {
             if (memcmp(r.hash, prefix, cfg.difficulty) != 0) break;
             if (cfg.debug) {
                 printf("MATCH "); print_hex(r.hash, HASH_SIZE);
-                printf(" %lu time=%.3f ms comps=%d\n", nonce_to_u64(r.nonce), (get_time() - t0) * 1000, comps);
+                printf(" %" PRIu64 " time=%.3f ms comps=%d\n", nonce_to_u64(r.nonce), (get_time() - t0) * 1000, comps);
             }
             matches++;
         }
