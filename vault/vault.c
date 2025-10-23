@@ -169,36 +169,116 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
 /* ---------- Merge Chunks ---------- */
 void merge_chunks() {
     int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd_out < 0) { perror("open"); exit(1); }
+    if (fd_out < 0) { perror("open final"); exit(1); }
 
+    /* open all tmp files */
+    FILE **fps = calloc(rounds, sizeof(FILE*));
+    int *indices = calloc(rounds, sizeof(int));
+    int nfiles = 0;
     for (uint64_t r = 0; r < rounds; r++) {
         char tmpfile[256];
         snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, r);
-        int fd_in = open(tmpfile, O_RDONLY);
-        if (fd_in < 0) continue;
-
-        off_t off = lseek(fd_out, 0, SEEK_END);
-        char buf[1<<20];
-        ssize_t n;
-        while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
-            /* Ensure full write and report errors */
-            ssize_t w = 0;
-            while (w < n) {
-                ssize_t r = pwrite(fd_out, buf + w, n - w, off + w);
-                if (r < 0) { perror("pwrite"); break; }
-                w += r;
-            }
-            off += (off_t)w;
-            if (n > 0 && w != n) {
-                fprintf(stderr, "Warning: short write while merging: expected %zd wrote %zd\n", n, w);
-                break;
-            }
-        }
-        close(fd_in);
-        remove(tmpfile);
+        FILE *f = fopen(tmpfile, "rb");
+        if (!f) continue;
+        fps[nfiles++] = f;
+        indices[nfiles-1] = (int)r; /* remember file index to remove later */
     }
+
+    if (nfiles == 0) { close(fd_out); free(fps); free(indices); return; }
+
+    /* heap node */
+    typedef struct { Record rec; int src; } Node;
+
+    /* simple binary min-heap by hash */
+    Node *heap = malloc(nfiles * sizeof(Node));
+    int heap_sz = 0;
+
+    auto heap_swap = [](Node *a, Node *b) {
+        Node t = *a; *a = *b; *b = t;
+    };
+
+    /* compare by hash */
+    auto node_less = [](const Node *x, const Node *y) {
+        int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
+        if (cmp != 0) return cmp < 0;
+        /* tie-breaker by nonce to get deterministic order */
+        return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
+    };
+
+    /* push initial record from each file */
+    for (int i = 0; i < nfiles; i++) {
+        if (fread(&heap[heap_sz].rec, sizeof(Record), 1, fps[i]) != 1) {
+            fclose(fps[i]);
+            fps[i] = NULL;
+            continue;
+        }
+        heap[heap_sz].src = i;
+        /* sift up */
+        int ci = heap_sz++;
+        while (ci > 0) {
+            int pi = (ci - 1) >> 1;
+            if (!node_less(&heap[ci], &heap[pi])) break;
+            Node tmp = heap[ci]; heap[ci] = heap[pi]; heap[pi] = tmp;
+            ci = pi;
+        }
+    }
+
+    /* merge */
+    while (heap_sz > 0) {
+        /* pop min (root) */
+        Node top = heap[0];
+        /* write top.rec to output */
+        const char *p = (const char*)&top.rec;
+        size_t remaining = sizeof(Record);
+        while (remaining > 0) {
+            ssize_t w = write(fd_out, p, remaining);
+            if (w < 0) { perror("write final"); goto cleanup; }
+            p += w;
+            remaining -= w;
+        }
+
+        int src = top.src;
+        /* replace root with next from same source (or remove if EOF) */
+        if (fps[src] && fread(&heap[0].rec, sizeof(Record), 1, fps[src]) == 1) {
+            heap[0].src = src;
+        } else {
+            /* remove root by replacing with last element */
+            heap[0] = heap[--heap_sz];
+        }
+        /* sift down root */
+        int i = 0;
+        while (1) {
+            int l = (i << 1) + 1;
+            int r = l + 1;
+            int smallest = i;
+            if (l < heap_sz && node_less(&heap[l], &heap[smallest])) smallest = l;
+            if (r < heap_sz && node_less(&heap[r], &heap[smallest])) smallest = r;
+            if (smallest == i) break;
+            Node tmp = heap[i]; heap[i] = heap[smallest]; heap[smallest] = tmp;
+            i = smallest;
+        }
+    }
+
+cleanup:
+    /* close and remove tmp files */
+    for (int i = 0; i < nfiles; i++) {
+        if (fps[i]) {
+            fclose(fps[i]);
+            char tmpfile[256];
+            snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
+            remove(tmpfile);
+        } else {
+            /* file was NULL because it couldn't be read initially; still try remove */
+            char tmpfile[256];
+            snprintf(tmpfile, sizeof(tmpfile), "%s.%lu", cfg.file_temp, (unsigned long)indices[i]);
+            remove(tmpfile);
+        }
+    }
+
     close(fd_out);
-    remove(cfg.file_temp);
+    free(heap);
+    free(fps);
+    free(indices);
 }
 
 /* ---------- Generate Mode ---------- */
