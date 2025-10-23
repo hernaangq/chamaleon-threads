@@ -84,7 +84,12 @@ typedef struct {
 
 void *write_worker(void *arg) {
     WriteJob *job = (WriteJob*)arg;
-    (void)pwrite(job->fd, job->buf, job->size, job->off);  // Suppress warning
+    ssize_t written = pwrite(job->fd, job->buf, job->size, job->off);
+    if (written < 0) {
+        perror("pwrite");
+    } else if ((size_t)written != job->size) {
+        fprintf(stderr, "Partial pwrite: expected %zu wrote %zd\n", job->size, written);
+    }
     free(job->buf);
     free(job);
     return NULL;
@@ -169,8 +174,18 @@ void merge_chunks() {
         char buf[1<<20];
         ssize_t n;
         while ((n = read(fd_in, buf, sizeof(buf))) > 0) {
-            (void)pwrite(fd_out, buf, n, off);  // Suppress warning
-            off += n;
+            /* Ensure full write and report errors */
+            ssize_t w = 0;
+            while (w < n) {
+                ssize_t r = pwrite(fd_out, buf + w, n - w, off + w);
+                if (r < 0) { perror("pwrite"); break; }
+                w += r;
+            }
+            off += (off_t)w;
+            if (n > 0 && w != n) {
+                fprintf(stderr, "Warning: short write while merging: expected %zd wrote %zd\n", n, w);
+                break;
+            }
         }
         close(fd_in);
         remove(tmpfile);
