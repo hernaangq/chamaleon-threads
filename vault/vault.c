@@ -378,7 +378,26 @@ int main(int argc, char *argv[]) {
             case 'q': cfg.difficulty = atoi(optarg); break;
             case 'v': cfg.verify = !strcmp(optarg, "true"); break;
             case 'h':
-                printf("Usage: ./vaultx -t 24 -i 1 -m 256 -k 26 -g memo.t -f memo.x\n");
+                printf("Usage: ./vaultx [OPTIONS]\n\n"
+                       "Options:\n"
+                       " -a, --approach [task|for] Parallelization mode (default: for)\n"
+                       " -t, --threads NUM Hashing threads (default: all cores)\n"
+                       " -i, --iothreads NUM Number of I/O threads to use (default: 1)\n"
+                       " -c, --compression NUM Compression: number of hash bytes to discard from the\n"
+                       "     end (0..HASH_SIZE)\n"
+                       " -k, --exponent NUM Exponent k for 2^K iterations (default: 26)\n"
+                       " -m, --memory NUM Memory size in MB (default: 1)\n"
+                       " -f, --file NAME Final output file (moved/renamed to at end)\n"
+                       " -g, --file_final NAME Temporary file (intermediate output)\n"
+                       " -d, --debug [true|false] Enable per-search debug prints (default: false)\n"
+                       " -b, --batch-size NUM Batch size (default: 1024)\n"
+                       " -p, --print NUM Print NUM records and exit\n"
+                       " -s, --search Enable search of specified number of records\n"
+                       " -q, --difficulty Set difficulty for search in bytes\n"
+                       " -h, --help Display this help message\n\n"
+                       "Example:\n"
+                       " ./vaultx -t 24 -i 1 -m 1024 -k 26 -g memo.t -f memo.x -d true\n");
+                return 0;
                 return 0;
         }
     }
