@@ -106,7 +106,10 @@ static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
 int record_cmp(const void *a, const void *b) {
     const Record *ra = (const Record*)a;
     const Record *rb = (const Record*)b;
-    return compare_hash_bytes(ra->hash, rb->hash);
+    int cmp = compare_hash_bytes(ra->hash, rb->hash);
+    if (cmp != 0) return cmp;
+    /* tie-break by nonce lexicographically (6 bytes) to match node_less */
+    return memcmp(ra->nonce, rb->nonce, NONCE_SIZE);
 }
 
 /* forward decl for parallel sorter (defined later) */
@@ -541,11 +544,17 @@ void mode_verify(const char *filename) {
     int valid = 1;
     uint64_t i = 0;
     while (fread(&curr, RECORD_SIZE, 1, f)) {
-        if (i > 0 && memcmp(prev.hash, curr.hash, HASH_SIZE) > 0) {
-            printf("ERROR at record %lu: ", i);
-            print_hex(prev.hash, HASH_SIZE); printf(" > "); print_hex(curr.hash, HASH_SIZE); printf("\n");
-            valid = 0;
-            break;
+        if (i > 0) {
+            int hcmp = compare_hash_bytes(prev.hash, curr.hash);
+            if (hcmp > 0 || (hcmp == 0 && memcmp(prev.nonce, curr.nonce, NONCE_SIZE) > 0)) {
+                printf("ERROR at record %lu: ", i);
+                print_hex(prev.hash, HASH_SIZE); printf(" / "); print_hex(prev.nonce, NONCE_SIZE);
+                printf(" > ");
+                print_hex(curr.hash, HASH_SIZE); printf(" / "); print_hex(curr.nonce, NONCE_SIZE);
+                printf("\n");
+                valid = 0;
+                break;
+            }
         }
         prev = curr;
         i++;
