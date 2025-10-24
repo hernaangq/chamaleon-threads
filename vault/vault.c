@@ -106,10 +106,7 @@ static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
 int record_cmp(const void *a, const void *b) {
     const Record *ra = (const Record*)a;
     const Record *rb = (const Record*)b;
-    int cmp = compare_hash_bytes(ra->hash, rb->hash);
-    if (cmp != 0) return cmp;
-    /* tie-break by nonce lexicographically (6 bytes) to match node_less */
-    return memcmp(ra->nonce, rb->nonce, NONCE_SIZE);
+    return compare_hash_bytes(ra->hash, rb->hash);
 }
 
 /* forward decl for parallel sorter (defined later) */
@@ -206,7 +203,6 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
 
     /* write chunk to the temporary file (not directly to final) */
     double tw0 = get_time();
-    /* write sorted chunk to its tmp file; merge_chunks will produce the global final file */
     int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { perror("open tmpfile"); free(buf); exit(1); }
     ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
@@ -216,6 +212,7 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     }
     close(fd);
     double tw1 = get_time();
+
     free(buf);
     double t1 = get_time();
 
@@ -244,7 +241,7 @@ static int node_less(const Node *x, const Node *y) {
 void merge_chunks() {
     double m0 = get_time();
 
-    int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT, 0666);
+    int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_out < 0) { perror("open final"); exit(1); }
 
     /* open all tmp files */
@@ -414,19 +411,10 @@ void mode_generate() {
         printf("Exponent K                  : %d\n", cfg.k);
         printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL<<30));
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
-        printf("Rounds                      : %" PRIu64 "\n", rounds);
+    printf("Rounds                      : %" PRIu64 "\n", rounds);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
     }
-
-    /* PREALLOCATE final file so per-chunk pwrite doesn't race with truncation */
-    int fd_pre = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd_pre < 0) { perror("open final for prealloc"); exit(1); }
-    if (ftruncate(fd_pre, (off_t)(total_records * sizeof(Record))) != 0) {
-        perror("ftruncate final");
-        /* not fatal, proceed */
-    }
-    close(fd_pre);
 
     double t0 = get_time();
     for (uint64_t r = 0; r < rounds; r++) {
@@ -437,7 +425,6 @@ void mode_generate() {
         generate_chunk(start, count, tmpfile);
     }
 
-    /* merge the per-chunk tmp files into the final globally-sorted file */
     merge_chunks();
 
     double total_time = get_time() - t0;
@@ -544,17 +531,11 @@ void mode_verify(const char *filename) {
     int valid = 1;
     uint64_t i = 0;
     while (fread(&curr, RECORD_SIZE, 1, f)) {
-        if (i > 0) {
-            int hcmp = compare_hash_bytes(prev.hash, curr.hash);
-            if (hcmp > 0 || (hcmp == 0 && memcmp(prev.nonce, curr.nonce, NONCE_SIZE) > 0)) {
-                printf("ERROR at record %lu: ", i);
-                print_hex(prev.hash, HASH_SIZE); printf(" / "); print_hex(prev.nonce, NONCE_SIZE);
-                printf(" > ");
-                print_hex(curr.hash, HASH_SIZE); printf(" / "); print_hex(curr.nonce, NONCE_SIZE);
-                printf("\n");
-                valid = 0;
-                break;
-            }
+        if (i > 0 && memcmp(prev.hash, curr.hash, HASH_SIZE) > 0) {
+            printf("ERROR at record %lu: ", i);
+            print_hex(prev.hash, HASH_SIZE); printf(" > "); print_hex(curr.hash, HASH_SIZE); printf("\n");
+            valid = 0;
+            break;
         }
         prev = curr;
         i++;
@@ -618,7 +599,7 @@ int main(int argc, char *argv[]) {
                        " -q, --difficulty Set difficulty for search in bytes\n"
                        " -h, --help Display this help message\n\n"
                        "Example:\n"
-                       " ./vaultx -t 24 -i 1 -m 256 -k 26 -g memo.t -f k26-memo.x -d true\n");
+                       " ./vaultx -t 24 -i 1 -m 1024 -k 26 -g memo.t -f memo.x -d true\n");
                 return 0;
                 return 0;
         }
