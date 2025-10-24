@@ -109,6 +109,9 @@ int record_cmp(const void *a, const void *b) {
     return compare_hash_bytes(ra->hash, rb->hash);
 }
 
+/* forward decl for parallel sorter (defined later) */
+static void parallel_qsort_records(Record *a, size_t n);
+
 /* ---------- I/O Worker ---------- */
 typedef struct {
     int fd;
@@ -617,5 +620,53 @@ int main(int argc, char *argv[]) {
     }
 
     return 0;
+}
+
+static void record_swap(Record *a, Record *b) {
+    Record t = *a; *a = *b; *b = t;
+}
+
+static void parallel_qsort_records(Record *a, size_t n) {
+    const size_t SERIAL_THRESHOLD = 1024;     /* use serial qsort for small arrays */
+    const size_t TASK_THRESHOLD   = 1 << 14;  /* only spawn tasks for large partitions */
+
+    if (n <= SERIAL_THRESHOLD) {
+        qsort(a, n, sizeof(Record), record_cmp);
+        return;
+    }
+
+    /* choose pivot (middle) and partition */
+    Record pivot = a[n / 2];
+    size_t i = 0, j = n - 1;
+    while (i <= j) {
+        while (record_cmp(&a[i], &pivot) < 0) i++;
+        while (record_cmp(&a[j], &pivot) > 0) {
+            if (j == 0) break; /* defensive */
+            j--;
+        }
+        if (i <= j) {
+            if (i != j) record_swap(&a[i], &a[j]);
+            i++; if (j == 0) break; j--;
+        }
+    }
+
+    /* recurse in parallel via OpenMP tasks */
+    if (j + 1 > 0) {
+        if (n > TASK_THRESHOLD) {
+            #pragma omp task firstprivate(a, j)
+            parallel_qsort_records(a, j + 1);
+        } else {
+            parallel_qsort_records(a, j + 1);
+        }
+    }
+    if (n > i) {
+        if (n > TASK_THRESHOLD) {
+            #pragma omp task firstprivate(a, i, n)
+            parallel_qsort_records(a + i, n - i);
+        } else {
+            parallel_qsort_records(a + i, n - i);
+        }
+    }
+    #pragma omp taskwait
 }
 
