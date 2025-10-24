@@ -203,13 +203,12 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
 
     /* write chunk to the temporary file (not directly to final) */
     double tw0 = get_time();
-    /* write directly into final file at the correct offset */
-    int fd = open(cfg.file_final, O_WRONLY);
-    if (fd < 0) { perror("open final for chunk write"); free(buf); exit(1); }
-    off_t off = (off_t)start * (off_t)sizeof(Record);
-    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), off);
+    /* write sorted chunk to its tmp file; merge_chunks will produce the global final file */
+    int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) { perror("open tmpfile"); free(buf); exit(1); }
+    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
     if (wrote < 0) {
-        perror("pwrite final");
+        perror("pwrite tmpfile");
         close(fd); free(buf); exit(1);
     }
     close(fd);
@@ -435,7 +434,8 @@ void mode_generate() {
         generate_chunk(start, count, tmpfile);
     }
 
-    /* merge_chunks() skipped because we write chunks directly into the final file with pwrite */
+    /* merge the per-chunk tmp files into the final globally-sorted file */
+    merge_chunks();
 
     double total_time = get_time() - t0;
     double mh = total_records / total_time / 1e6;
