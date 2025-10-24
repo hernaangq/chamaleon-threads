@@ -16,6 +16,7 @@
 
 #define NONCE_SIZE 6
 #define HASH_SIZE  10
+/* keep RECORD_SIZE macro present but we will use runtime record_size variable */
 #define RECORD_SIZE (HASH_SIZE + NONCE_SIZE)
 
 typedef struct {
@@ -40,6 +41,11 @@ typedef struct {
 
 Config cfg = {0};
 uint64_t total_records, chunk_size, rounds;
+
+/* Compression/runtime sizing globals */
+int compression = 0;                /* number of bytes to drop from end of hash */
+int effective_hash_len = HASH_SIZE; /* HASH_SIZE - compression */
+int record_size = HASH_SIZE + NONCE_SIZE; /* effective on-disk record size */
 
 double get_time() {
     struct timeval tv;
@@ -67,38 +73,16 @@ void generate_hash(uint64_t nonce_val, Record *rec) {
     blake3_hasher hasher;
     blake3_hasher_init(&hasher);
     blake3_hasher_update(&hasher, rec->nonce, NONCE_SIZE);
+    /* generate full HASH_SIZE bytes into rec->hash */
     blake3_hasher_finalize(&hasher, rec->hash, HASH_SIZE);
 }
 
-/* fast lexicographic compare for 10-byte hashes:
-   compare first 8 bytes as big-endian uint64, then remaining 2 bytes as big-endian uint16 */
-static inline uint64_t be_u64(const uint8_t *p) {
-    uint64_t v;
-    memcpy(&v, p, 8);
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-    v = __builtin_bswap64(v);
-#endif
-    return v;
-}
-static inline uint16_t be_u16(const uint8_t *p) {
-    uint16_t v;
-    memcpy(&v, p, 2);
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-    v = (uint16_t)((v << 8) | (v >> 8));
-#endif
-    return v;
-}
-
-/* returns -1,0,1 like memcmp on HASH_SIZE bytes */
+/* returns -1,0,1 like memcmp on effective_hash_len bytes */
 static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
-    uint64_t va = be_u64(a);
-    uint64_t vb = be_u64(b);
-    if (va < vb) return -1;
-    if (va > vb) return 1;
-    uint16_t sa = be_u16(a + 8);
-    uint16_t sb = be_u16(b + 8);
-    if (sa < sb) return -1;
-    if (sa > sb) return 1;
+    if (effective_hash_len == 0) return 0; /* nothing to compare */
+    int cmp = memcmp(a, b, effective_hash_len);
+    if (cmp < 0) return -1;
+    if (cmp > 0) return 1;
     return 0;
 }
 
@@ -149,6 +133,21 @@ void *hash_worker(void *arg) {
     return NULL;
 }
 
+/* pack a single Record into dst (dst must have room for record_size bytes) */
+static inline void pack_record(const Record *r, void *dst) {
+    memcpy(dst, r->hash, effective_hash_len);
+    memcpy((char*)dst + effective_hash_len, r->nonce, NONCE_SIZE);
+}
+
+/* unpack from src (record_size bytes) into a Record struct */
+static inline void unpack_record(const void *src, Record *r) {
+    /* copy effective hash bytes to r->hash[0..effective_hash_len-1] */
+    memcpy(r->hash, src, effective_hash_len);
+    /* zero the remainder of r->hash (optional but safer) */
+    if (effective_hash_len < HASH_SIZE) memset(r->hash + effective_hash_len, 0, HASH_SIZE - effective_hash_len);
+    memcpy(r->nonce, (char*)src + effective_hash_len, NONCE_SIZE);
+}
+
 /* ---------- Generate + Sort + Write Chunk ---------- */
 ssize_t safe_pwrite_all(int fd, const void *buf, size_t size, off_t off) {
     const char *p = buf;
@@ -166,7 +165,7 @@ ssize_t safe_pwrite_all(int fd, const void *buf, size_t size, off_t off) {
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     double t0 = get_time();
 
-    /* allocate records using sizeof(Record) */
+    /* allocate records using sizeof(Record) (in-memory full struct) */
     Record *buf = malloc(count * sizeof(Record));
     if (!buf) { perror("malloc"); exit(1); }
 
@@ -205,12 +204,24 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     double tw0 = get_time();
     int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { perror("open tmpfile"); free(buf); exit(1); }
-    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
+
+    /* pack buffer into compact on-disk format */
+    size_t out_size = (size_t)count * (size_t)record_size;
+    char *out = malloc(out_size);
+    if (!out) { perror("malloc out"); close(fd); free(buf); exit(1); }
+    char *p = out;
+    for (uint64_t i = 0; i < count; i++) {
+        pack_record(&buf[i], p);
+        p += record_size;
+    }
+
+    ssize_t wrote = safe_pwrite_all(fd, out, out_size, 0);
     if (wrote < 0) {
         perror("pwrite tmpfile");
-        close(fd); free(buf); exit(1);
+        close(fd); free(buf); free(out); exit(1);
     }
     close(fd);
+    free(out);
     double tw1 = get_time();
 
     free(buf);
@@ -263,7 +274,7 @@ void merge_chunks() {
     const size_t IN_RECS = 4096;   /* tune: number of records to read per fread */
     typedef struct {
         FILE *f;
-        Record *buf;
+        Record *buf;    /* in-memory Records (full struct) */
         size_t len; /* valid records in buf */
         size_t pos; /* next index to consume */
         int idx;    /* file index (for removal naming) */
@@ -273,10 +284,20 @@ void merge_chunks() {
     for (int i = 0; i < nfiles; i++) {
         fb[i].f = fps[i];
         fb[i].buf = malloc(IN_RECS * sizeof(Record));
-        fb[i].len = fread(fb[i].buf, sizeof(Record), IN_RECS, fb[i].f);
+        /* read packed records and unpack into fb[i].buf */
+        char *tmpbuf = malloc(IN_RECS * record_size);
+        if (!tmpbuf) { perror("malloc tmpbuf"); exit(1); }
+        size_t nread = fread(tmpbuf, record_size, IN_RECS, fb[i].f);
+        fb[i].len = nread;
         fb[i].pos = 0;
         fb[i].idx = indices[i];
+        for (size_t j = 0; j < nread; j++) {
+            unpack_record(tmpbuf + j * record_size, &fb[i].buf[j]);
+        }
+        free(tmpbuf);
         if (fb[i].len == 0) { /* empty file */
+            free(fb[i].buf);
+            fb[i].buf = NULL;
             fclose(fb[i].f);
             fb[i].f = NULL;
         }
@@ -288,7 +309,7 @@ void merge_chunks() {
 
     /* push initial record from each file (from buffer) */
     for (int i = 0; i < nfiles; i++) {
-        if (!fb[i].f) continue;
+        if (!fb[i].f || !fb[i].buf) continue;
         heap[heap_sz].rec = fb[i].buf[fb[i].pos++];
         heap[heap_sz].src = i;
         heap_sz++;
@@ -315,15 +336,25 @@ void merge_chunks() {
         /* append to outbuf */
         outbuf[out_cnt++] = top.rec;
         if (out_cnt == OUT_RECS) {
-            /* flush */
-            const char *p = (const char *)outbuf;
-            size_t remaining = out_cnt * sizeof(Record);
+            /* flush: pack outbuf into compact buffer and write */
+            size_t pack_size = out_cnt * record_size;
+            char *pack = malloc(pack_size);
+            if (!pack) { perror("malloc pack"); goto cleanup; }
+            char *pp = pack;
+            for (size_t ii = 0; ii < out_cnt; ii++) {
+                pack_record(&outbuf[ii], pp);
+                pp += record_size;
+            }
+            /* write all */
+            const char *p = pack;
+            size_t remaining = pack_size;
             while (remaining > 0) {
                 ssize_t w = write(fd_out, p, remaining);
-                if (w < 0) { perror("write final"); goto cleanup; }
+                if (w < 0) { perror("write final"); free(pack); goto cleanup; }
                 p += w;
                 remaining -= w;
             }
+            free(pack);
             out_cnt = 0;
         }
 
@@ -334,9 +365,16 @@ void merge_chunks() {
             heap[0].src = src;
         } else if (fb[src].f) {
             /* buffer exhausted; try to refill */
-            fb[src].len = fread(fb[src].buf, sizeof(Record), IN_RECS, fb[src].f);
+            /* read packed records and unpack into fb[src].buf */
+            char *tmpbuf = malloc(IN_RECS * record_size);
+            if (!tmpbuf) { perror("malloc tmpbuf2"); goto cleanup; }
+            size_t nread = fread(tmpbuf, record_size, IN_RECS, fb[src].f);
+            fb[src].len = nread;
             fb[src].pos = 0;
-            if (fb[src].len > 0) {
+            if (nread > 0) {
+                for (size_t j = 0; j < nread; j++) {
+                    unpack_record(tmpbuf + j * record_size, &fb[src].buf[j]);
+                }
                 heap[0].rec = fb[src].buf[fb[src].pos++];
                 heap[0].src = src;
             } else {
@@ -345,6 +383,7 @@ void merge_chunks() {
                 fb[src].f = NULL;
                 heap[0] = heap[--heap_sz];
             }
+            free(tmpbuf);
         } else {
             /* file already closed, should not happen */
             heap[0] = heap[--heap_sz];
@@ -366,14 +405,23 @@ void merge_chunks() {
 
     /* flush remaining output */
     if (out_cnt > 0) {
-        const char *p = (const char *)outbuf;
-        size_t remaining = out_cnt * sizeof(Record);
+        size_t pack_size = out_cnt * record_size;
+        char *pack = malloc(pack_size);
+        if (!pack) { perror("malloc pack_final"); goto cleanup; }
+        char *pp = pack;
+        for (size_t ii = 0; ii < out_cnt; ii++) {
+            pack_record(&outbuf[ii], pp);
+            pp += record_size;
+        }
+        const char *p = pack;
+        size_t remaining = pack_size;
         while (remaining > 0) {
             ssize_t w = write(fd_out, p, remaining);
-            if (w < 0) { perror("write final"); goto cleanup; }
+            if (w < 0) { perror("write final"); free(pack); goto cleanup; }
             p += w;
             remaining -= w;
         }
+        free(pack);
         out_cnt = 0;
     }
 
@@ -401,7 +449,7 @@ cleanup:
 void mode_generate() {
     total_records = 1ULL << cfg.k;
     uint64_t mem_bytes = (uint64_t)cfg.memory_mb * 1024 * 1024;
-    chunk_size = mem_bytes / RECORD_SIZE;
+    chunk_size = mem_bytes / record_size;
     if (chunk_size == 0) chunk_size = 1;
     rounds = (total_records + chunk_size - 1) / chunk_size;
 
@@ -409,11 +457,14 @@ void mode_generate() {
         printf("Selected Approach           : %s\n", cfg.approach);
         printf("Number of Threads           : %d\n", cfg.threads);
         printf("Exponent K                  : %d\n", cfg.k);
-        printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL<<30));
+        printf("File Size (GB)              : %.2f\n", (double)total_records * record_size / (1ULL<<30));
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
-    printf("Rounds                      : %" PRIu64 "\n", rounds);
+        printf("Rounds                      : %" PRIu64 "\n", rounds);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
+        printf("Compression bytes dropped   : %d\n", compression);
+        printf("Effective hash bytes        : %d\n", effective_hash_len);
+        printf("On-disk record size         : %d\n", record_size);
     }
 
     double t0 = get_time();
@@ -429,7 +480,7 @@ void mode_generate() {
 
     double total_time = get_time() - t0;
     double mh = total_records / total_time / 1e6;
-    double mb = total_records * RECORD_SIZE / total_time / 1048576.0;
+    double mb = (double)total_records * record_size / total_time / 1048576.0;
     printf("Total Throughput: %.2f MH/s  %.2f MB/s\n", mh, mb);
     printf("Total Time: %.6f seconds\n", total_time);
 }
@@ -439,14 +490,19 @@ void mode_print(const char *filename, int n) {
     FILE *f = fopen(filename, "rb");
     if (!f) { perror("fopen"); exit(1); }
     Record r;
-    for (int i = 0; i < n && fread(&r, RECORD_SIZE, 1, f); i++) {
-        printf("[%d] stored: ", i * RECORD_SIZE);
+    char *tmp = malloc(record_size);
+    if (!tmp) { perror("malloc tmp"); fclose(f); exit(1); }
+    for (int i = 0; i < n && fread(tmp, record_size, 1, f); i++) {
+        unpack_record(tmp, &r);
+        off_t offset = (off_t)i * record_size;
+        printf("[%lld] stored: ", (long long)offset);
         if (is_zero_nonce(r.nonce)) printf("BLANK nonce: BLANK\n");
         else {
-            print_hex(r.hash, HASH_SIZE);
+            print_hex(r.hash, effective_hash_len);
             printf(" nonce: %" PRIu64 "\n", nonce_to_u64(r.nonce));
         }
     }
+    free(tmp);
     fclose(f);
 }
 
@@ -460,38 +516,43 @@ void mode_search(const char *filename) {
     printf("searches=%d difficulty=%d\n", cfg.search_num, cfg.difficulty);
     printf("Parsed k                     : %d\n", cfg.k);
     printf("Nonce Size                   : %d\n", NONCE_SIZE);
-    printf("Record Size                  : %d\n", RECORD_SIZE);
-    printf("Hash Size                    : %d\n", HASH_SIZE);
-    printf("On-disk Record Size          : %d\n", RECORD_SIZE);
+    printf("Record Size                  : %d\n", record_size);
+    printf("Hash Size (stored)           : %d\n", effective_hash_len);
+    printf("On-disk Record Size          : %d\n", record_size);
     printf("Number of Buckets            : %" PRIu64 "\n", (uint64_t)(1ULL << 24));
     printf("Number of Records in Bucket  : %" PRIu64 "\n", (uint64_t)(1ULL << (cfg.k - 24)) );
     printf("Number of Hashes             : %" PRIu64 "\n", total_records);
-    printf("File Size to be read (bytes) : %" PRIu64 "\n", (uint64_t)(total_records * RECORD_SIZE));
-    printf("File Size to be read (GB)    : %.6f\n", (double)(total_records * RECORD_SIZE) / (1ULL << 30));
+    printf("File Size to be read (bytes) : %" PRIu64 "\n", (uint64_t)(total_records * (uint64_t)record_size));
+    printf("File Size to be read (GB)    : %.6f\n", (double)(total_records * (uint64_t)record_size) / (1ULL << 30));
     printf("Actual file size on disk     : %lld bytes\n", (long long)st.st_size);
 
     srand(time(NULL));
     double total_time = 0, total_seeks = 0, total_comps = 0, total_matches = 0;
     int found = 0, notfound = 0;
 
+    char *tmp = malloc(record_size);
+    if (!tmp) { perror("malloc tmp"); fclose(f); exit(1); }
+
     for (int q = 0; q < cfg.search_num; q++) {
-        uint8_t prefix[10] = {0};
+        uint8_t prefix[HASH_SIZE];
+        memset(prefix, 0, sizeof(prefix));
         for (int i = 0; i < cfg.difficulty; i++) prefix[i] = rand() & 0xFF;
 
         double t0 = get_time();
         uint64_t idx = 0;
         for (int i = 0; i < cfg.difficulty; i++) idx = (idx << 8) | prefix[i];
         idx = (idx * total_records) >> (cfg.difficulty * 8);
-        off_t byte_off = idx * RECORD_SIZE;
+        off_t byte_off = (off_t)idx * (off_t)record_size;
         fseek(f, byte_off, SEEK_SET);
 
         int comps = 0, matches = 0;
         Record r;
-        while (fread(&r, RECORD_SIZE, 1, f) == 1) {
+        while (fread(tmp, record_size, 1, f) == 1) {
+            unpack_record(tmp, &r);
             comps++;
             if (memcmp(r.hash, prefix, cfg.difficulty) != 0) break;
             if (cfg.debug) {
-                printf("MATCH "); print_hex(r.hash, HASH_SIZE);
+                printf("MATCH "); print_hex(r.hash, effective_hash_len);
                 printf(" %" PRIu64 " time=%.3f ms comps=%d\n", nonce_to_u64(r.nonce), (get_time() - t0) * 1000, comps);
             }
             matches++;
@@ -504,6 +565,7 @@ void mode_search(const char *filename) {
         total_matches += matches;
         if (matches) found++; else notfound++;
     }
+    free(tmp);
     fclose(f);
 
     double avg_ms = total_time * 1000 / cfg.search_num;
@@ -530,16 +592,20 @@ void mode_verify(const char *filename) {
     Record prev = {0}, curr;
     int valid = 1;
     uint64_t i = 0;
-    while (fread(&curr, RECORD_SIZE, 1, f)) {
-        if (i > 0 && memcmp(prev.hash, curr.hash, HASH_SIZE) > 0) {
+    char *tmp = malloc(record_size);
+    if (!tmp) { perror("malloc tmp"); fclose(f); exit(1); }
+    while (fread(tmp, record_size, 1, f)) {
+        unpack_record(tmp, &curr);
+        if (i > 0 && memcmp(prev.hash, curr.hash, effective_hash_len) > 0) {
             printf("ERROR at record %lu: ", i);
-            print_hex(prev.hash, HASH_SIZE); printf(" > "); print_hex(curr.hash, HASH_SIZE); printf("\n");
+            print_hex(prev.hash, effective_hash_len); printf(" > "); print_hex(curr.hash, effective_hash_len); printf("\n");
             valid = 0;
             break;
         }
         prev = curr;
         i++;
     }
+    free(tmp);
     fclose(f);
     if (valid) printf("Sorted order verified: %lu records\n", i);
 }
@@ -556,6 +622,7 @@ int main(int argc, char *argv[]) {
     cfg.search_num = 0;
     cfg.difficulty = 3;
     cfg.verify = 0;
+    compression = 0;
 
     int opt;
     static struct option long_opts[] = {
@@ -563,10 +630,10 @@ int main(int argc, char *argv[]) {
         {"exponent", 1, 0, 'k'}, {"memory", 1, 0, 'm'}, {"file", 1, 0, 'f'},
         {"file_final", 1, 0, 'g'}, {"debug", 1, 0, 'd'}, {"print", 1, 0, 'p'},
         {"search", 1, 0, 's'}, {"difficulty", 1, 0, 'q'}, {"verify", 1, 0, 'v'},
-        {"help", 0, 0, 'h'}, {0,0,0,0}
+        {"compression", 1, 0, 'c'}, {"help", 0, 0, 'h'}, {0,0,0,0}
     };
 
-    while ((opt = getopt_long(argc, argv, "a:t:i:k:m:f:g:d:p:s:q:v:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:t:i:k:m:f:g:d:p:s:q:v:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'a': cfg.approach = optarg; break;
             case 't': cfg.threads = atoi(optarg); break;
@@ -580,6 +647,7 @@ int main(int argc, char *argv[]) {
             case 's': cfg.search_num = atoi(optarg); break;
             case 'q': cfg.difficulty = atoi(optarg); break;
             case 'v': cfg.verify = !strcmp(optarg, "true"); break;
+            case 'c': compression = atoi(optarg); break;
             case 'h':
                 printf("Usage: ./vaultx [OPTIONS]\n\n"
                        "Options:\n"
@@ -599,11 +667,17 @@ int main(int argc, char *argv[]) {
                        " -q, --difficulty Set difficulty for search in bytes\n"
                        " -h, --help Display this help message\n\n"
                        "Example:\n"
-                       " ./vaultx -t 24 -i 1 -m 1024 -k 26 -g memo.t -f memo.x -d true\n");
+                       " ./vaultx -t 24 -i 1 -m 1024 -k 26 -g memo.t -f memo.x -c 2 -d true\n");
                 return 0;
                 return 0;
         }
     }
+
+    /* sanitize compression */
+    if (compression < 0) compression = 0;
+    if (compression > HASH_SIZE) compression = HASH_SIZE;
+    effective_hash_len = HASH_SIZE - compression;
+    record_size = effective_hash_len + NONCE_SIZE;
 
     if (cfg.print_num > 0) {
         mode_print(cfg.file_final, cfg.print_num);
@@ -669,4 +743,3 @@ static void parallel_qsort_records(Record *a, size_t n) {
     }
     #pragma omp taskwait
 }
-
