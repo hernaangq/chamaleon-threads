@@ -28,8 +28,8 @@ typedef struct {
 
 typedef struct {
     Record rec;
-    int src;
-} Node;
+    int file_index;
+} HeapEntry;
 
 typedef struct {
     char *approach;
@@ -80,6 +80,36 @@ void generate_hash(uint64_t nonce_val, Record *rec) {
     blake3_hasher_finalize(&hasher, rec->hash, HASH_SIZE);
 }
 
+static inline uint64_t be_u64(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    v = __builtin_bswap64(v);
+#endif
+    return v;
+}
+
+static inline uint16_t be_u16(const uint8_t *p) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    v = __builtin_bswap16(v);
+#endif
+    return v;
+}
+
+static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
+    uint64_t va = be_u64(a);
+    uint64_t vb = be_u64(b);
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    uint16_t sa = be_u16(a + 8);
+    uint16_t sb = be_u16(b + 8);
+    if (sa < sb) return -1;
+    if (sa > sb) return 1;
+    return 0;
+}
+
 int record_cmp(const void *a, const void *b) {
     return compare_hash_bytes(((Record*)a)->hash, ((Record*)b)->hash);
 }
@@ -115,19 +145,8 @@ void *hash_thread(void *arg) {
     return NULL;
 }
 
-ssize_t safe_pwrite_all(int fd, const void *buf, size_t count, off_t offset) {
-    size_t written = 0;
-    while (written < count) {
-        ssize_t w = pwrite(fd, (const char*)buf + written, count - written, offset + written);
-        if (w < 0) return w;
-        if (w == 0) break;
-        written += w;
-    }
-    return written;
-}
-
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
-    Record *buf = malloc(count * sizeof(Record));
+    Record *buf = malloc(count * RECORD_SIZE);
     if (!buf) { perror("malloc"); exit(1); }
 
     if (!strcmp(cfg.approach, "for")) {
@@ -179,23 +198,10 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     free(buf);
 }
 
-static int node_less(const Node *x, const Node *y) {
-    int cmp = compare_hash_bytes(x->rec.hash, y->rec.hash);
-    if (cmp != 0) return cmp < 0;
-    return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
-}
-
-static void heap_swap(Node *a, Node *b) {
-    Node t = *a;
-    *a = *b;
-    *b = t;
-}
-
 void merge_chunks() {
     double global_t0 = get_time();
-    double shuffle_t0 = get_time();
+    double shuffle_t0 = get_time;
     int num_files = (int)rounds;
-
     FILE *ins[num_files];
     for (int i = 0; i < num_files; i++) {
         char tmpfile[256];
@@ -459,18 +465,18 @@ static void record_swap(Record *a, Record *b) {
 }
 
 static void parallel_qsort_records(Record *a, size_t n) {
-    const size_t SERIAL_THRESHOLD = 1024; // use serial qsort for small arrays
+    const size_t SERIAL_THRESHOLD = 1024;
     if (n <= SERIAL_THRESHOLD) {
-        qsort(a, n, sizeof(Record), record_cmp);
+        qsort(a, n, RECORD_SIZE, record_cmp);
         return;
     }
 
     // Median of three pivot selection
-    Record *p1 = &a[0], *p2 = &a[n/2], *p3 = &a[n-1];
-    if (record_cmp(p1, p2) > 0) record_swap(p1, p2);
-    if (record_cmp(p1, p3) > 0) record_swap(p1, p3);
-    if (record_cmp(p2, p3) > 0) record_swap(p2, p3);
-    Record pivot = *p2;
+    size_t mid = n / 2;
+    if (record_cmp(&a[0], &a[mid]) > 0) record_swap(&a[0], &a[mid]);
+    if (record_cmp(&a[0], &a[n-1]) > 0) record_swap(&a[0], &a[n-1]);
+    if (record_cmp(&a[mid], &a[n-1]) > 0) record_swap(&a[mid], &a[n-1]);
+    Record pivot = a[mid];
 
     size_t i = 0, j = n - 1;
     while (i <= j) {
@@ -479,6 +485,7 @@ static void parallel_qsort_records(Record *a, size_t n) {
         if (i <= j) {
             record_swap(&a[i], &a[j]);
             i++;
+            if (j == 0) break; // prevent underflow
             j--;
         }
     }
@@ -542,7 +549,7 @@ int main(int argc, char *argv[]) {
             case 'v': cfg.verify = !strcmp(optarg, "true"); break;
             case 'h':
                 printf("Usage: ./vaultx [OPTIONS]\n");
-                // print usage
+                // print usage as in homework
                 return 0;
         }
     }
