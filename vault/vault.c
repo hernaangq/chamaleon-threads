@@ -145,6 +145,48 @@ void *hash_thread(void *arg) {
     return NULL;
 }
 
+static void record_swap(Record *a, Record *b) {
+    Record t = *a;
+    *a = *b;
+    *b = t;
+}
+
+static void parallel_qsort_records(Record *a, size_t n) {
+    const size_t SERIAL_THRESHOLD = 1024;
+    if (n <= SERIAL_THRESHOLD) {
+        qsort(a, n, RECORD_SIZE, record_cmp);
+        return;
+    }
+
+    // Median of three pivot selection
+    size_t mid = n / 2;
+    if (record_cmp(&a[0], &a[mid]) > 0) record_swap(&a[0], &a[mid]);
+    if (record_cmp(&a[0], &a[n-1]) > 0) record_swap(&a[0], &a[n-1]);
+    if (record_cmp(&a[mid], &a[n-1]) > 0) record_swap(&a[mid], &a[n-1]);
+    Record pivot = a[mid];
+
+    size_t i = 0, j = n - 1;
+    while (i <= j) {
+        while (record_cmp(&a[i], &pivot) < 0) i++;
+        while (record_cmp(&a[j], &pivot) > 0) {
+            if (j == 0) break;
+            j--;
+        }
+        if (i <= j) {
+            record_swap(&a[i], &a[j]);
+            i++;
+            if (j == 0) break;
+            j--;
+        }
+    }
+
+    #pragma omp task
+    parallel_qsort_records(a, i);
+    #pragma omp task
+    parallel_qsort_records(a + i, n - i);
+    #pragma omp taskwait
+}
+
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     Record *buf = malloc(count * RECORD_SIZE);
     if (!buf) { perror("malloc"); exit(1); }
@@ -282,8 +324,8 @@ void mode_generate() {
         printf("Size of NONCE               : %d\n", NONCE_SIZE);
         printf("Size of MemoRecord          : %d\n", RECORD_SIZE);
         printf("Rounds                      : %" PRIu64 "\n", rounds);
-        printf("Number of Buckets           : %" PRIu64 "\n", NUM_BUCKETS);
-        printf("Number of Records in Bucket : %" PRIu64 "\n", bucket_size);
+        printf("Number of Buckets           : %lu\n", (unsigned long)NUM_BUCKETS);
+        printf("Number of Records in Bucket : %lu\n", (unsigned long)bucket_size);
         printf("BATCH_SIZE                  : %d\n", cfg.batch_size);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
@@ -377,8 +419,8 @@ void mode_search(const char *filename) {
     printf("Record Size                  : %d\n", RECORD_SIZE);
     printf("Hash Size                    : %d\n", HASH_SIZE);
     printf("On-disk Record Size          : %d\n", RECORD_SIZE);
-    printf("Number of Buckets            : %" PRIu64 "\n", NUM_BUCKETS);
-    printf("Number of Records in Bucket  : %" PRIu64 "\n", bucket_size);
+    printf("Number of Buckets            : %lu\n", (unsigned long)NUM_BUCKETS);
+    printf("Number of Records in Bucket  : %lu\n", (unsigned long)bucket_size);
     printf("Number of Hashes      : %" PRIu64 "\n", total_records);
     printf("File Size to be read (bytes) : %" PRIu64 "\n", total_records * RECORD_SIZE);
     printf("File Size to be read (GB)    : %.6f\n", (double)total_records * RECORD_SIZE / (1ULL << 30));
@@ -458,48 +500,6 @@ void mode_search(const char *filename) {
     printf("avg_matches_per_found=%.3f\n", avg_matches);
 }
 
-static void record_swap(Record *a, Record *b) {
-    Record t = *a;
-    *a = *b;
-    *b = t;
-}
-
-static void parallel_qsort_records(Record *a, size_t n) {
-    const size_t SERIAL_THRESHOLD = 1024;
-    if (n <= SERIAL_THRESHOLD) {
-        qsort(a, n, RECORD_SIZE, record_cmp);
-        return;
-    }
-
-    // Median of three pivot selection
-    size_t mid = n / 2;
-    if (record_cmp(&a[0], &a[mid]) > 0) record_swap(&a[0], &a[mid]);
-    if (record_cmp(&a[0], &a[n-1]) > 0) record_swap(&a[0], &a[n-1]);
-    if (record_cmp(&a[mid], &a[n-1]) > 0) record_swap(&a[mid], &a[n-1]);
-    Record pivot = a[mid];
-
-    size_t i = 0, j = n - 1;
-    while (i <= j) {
-        while (record_cmp(&a[i], &pivot) < 0) i++;
-        while (record_cmp(&a[j], &pivot) > 0) {
-            if (j == 0) break;
-            j--;
-        }
-        if (i <= j) {
-            record_swap(&a[i], &a[j]);
-            i++;
-            if (j == 0) break;
-            j--;
-        }
-    }
-
-    #pragma omp task
-    parallel_qsort_records(a, i);
-    #pragma omp task
-    parallel_qsort_records(a + i, n - i);
-    #pragma omp taskwait
-}
-
 int main(int argc, char *argv[]) {
     cfg.approach = "for";
     cfg.threads = omp_get_max_threads();
@@ -552,7 +552,7 @@ int main(int argc, char *argv[]) {
             case 'v': cfg.verify = !strcmp(optarg, "true"); break;
             case 'h':
                 printf("Usage: ./vaultx [OPTIONS]\n");
-                // print usage as in homework
+                // print usage
                 return 0;
         }
     }
