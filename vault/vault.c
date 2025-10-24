@@ -242,7 +242,7 @@ static int node_less(const Node *x, const Node *y) {
 void merge_chunks() {
     double m0 = get_time();
 
-    int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT, 0666);
     if (fd_out < 0) { perror("open final"); exit(1); }
 
     /* open all tmp files */
