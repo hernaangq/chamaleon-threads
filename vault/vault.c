@@ -27,6 +27,11 @@ typedef struct {
 } Record;
 
 typedef struct {
+    Record rec;
+    int src;
+} Node;
+
+typedef struct {
     char *approach;
     int threads;
     int iothreads;
@@ -75,43 +80,8 @@ void generate_hash(uint64_t nonce_val, Record *rec) {
     blake3_hasher_finalize(&hasher, rec->hash, HASH_SIZE);
 }
 
-static inline uint64_t be_u64(const uint8_t *p) {
-    uint64_t v;
-    memcpy(&v, p, 8);
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-    v = __builtin_bswap64(v);
-#endif
-    return v;
-}
-
-static inline uint16_t be_u16(const uint8_t *p) {
-    uint16_t v;
-    memcpy(&v, p, 2);
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-    v = __builtin_bswap16(v);
-#endif
-    return v;
-}
-
-static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
-    int cmp_len = HASH_SIZE - cfg.compression;
-    uint64_t va = be_u64(a);
-    uint64_t vb = be_u64(b);
-    if (va < vb) return -1;
-    if (va > vb) return 1;
-    if (cmp_len > 8) {
-        uint16_t sa = be_u16(a + 8);
-        uint16_t sb = be_u16(b + 8);
-        if (sa < sb) return -1;
-        if (sa > sb) return 1;
-    }
-    return 0;
-}
-
 int record_cmp(const void *a, const void *b) {
-    const Record *ra = (const Record*)a;
-    const Record *rb = (const Record*)b;
-    return compare_hash_bytes(ra->hash, rb->hash);
+    return compare_hash_bytes(((Record*)a)->hash, ((Record*)b)->hash);
 }
 
 typedef struct {
@@ -145,6 +115,17 @@ void *hash_thread(void *arg) {
     return NULL;
 }
 
+ssize_t safe_pwrite_all(int fd, const void *buf, size_t count, off_t offset) {
+    size_t written = 0;
+    while (written < count) {
+        ssize_t w = pwrite(fd, (const char*)buf + written, count - written, offset + written);
+        if (w < 0) return w;
+        if (w == 0) break;
+        written += w;
+    }
+    return written;
+}
+
 void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     Record *buf = malloc(count * sizeof(Record));
     if (!buf) { perror("malloc"); exit(1); }
@@ -171,28 +152,20 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
         free(tids);
     }
 
-    qsort(buf, count, sizeof(Record), record_cmp);
+    parallel_qsort_records(buf, count);
 
     int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) { perror("open"); exit(1); }
-
-    int packed_size = HASH_SIZE - cfg.compression + NONCE_SIZE;
-    char *packed = malloc(count * packed_size);
-    for (uint64_t i = 0; i < count; i++) {
-        memcpy(packed + i * packed_size, buf[i].hash, HASH_SIZE - cfg.compression);
-        memcpy(packed + i * packed_size + HASH_SIZE - cfg.compression, buf[i].nonce, NONCE_SIZE);
-    }
-    free(buf);
 
     uint64_t per_io = count / cfg.iothreads;
     pthread_t *io_tids = malloc(cfg.iothreads * sizeof(pthread_t));
     for (int t = 0; t < cfg.iothreads; t++) {
         uint64_t s = t * per_io;
         uint64_t e = (t == cfg.iothreads - 1) ? count : (t + 1) * per_io;
-        size_t size = (e - s) * packed_size;
-        off_t off = s * packed_size;
+        size_t size = (e - s) * RECORD_SIZE;
+        off_t off = s * RECORD_SIZE;
         char *data = malloc(size);
-        memcpy(data, packed + s * packed_size, size);
+        memcpy(data, (char*)buf + s * RECORD_SIZE, size);
         WriteJob *job = malloc(sizeof(WriteJob));
         job->fd = fd;
         job->off = off;
@@ -203,86 +176,56 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
     for (int t = 0; t < cfg.iothreads; t++) pthread_join(io_tids[t], NULL);
     free(io_tids);
     close(fd);
-    free(packed);
+    free(buf);
+}
+
+static int node_less(const Node *x, const Node *y) {
+    int cmp = compare_hash_bytes(x->rec.hash, y->rec.hash);
+    if (cmp != 0) return cmp < 0;
+    return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
+}
+
+static void heap_swap(Node *a, Node *b) {
+    Node t = *a;
+    *a = *b;
+    *b = t;
 }
 
 void merge_chunks() {
     double global_t0 = get_time();
     double shuffle_t0 = get_time();
     int num_files = (int)rounds;
-    int packed_size = HASH_SIZE - cfg.compression + NONCE_SIZE;
 
-    int fd_out = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd_out < 0) { perror("open final"); exit(1); }
-
-    struct {
-        int fd;
-        Record *map;
-        size_t num_records;
-    } files[num_files];
-    int active_files = 0;
+    FILE *ins[num_files];
     for (int i = 0; i < num_files; i++) {
         char tmpfile[256];
         snprintf(tmpfile, sizeof(tmpfile), "%s.%" PRIu64, cfg.file_temp, (uint64_t)i);
-        int fd = open(tmpfile, O_RDONLY);
-        if (fd < 0) continue;
-        off_t fsize = lseek(fd, 0, SEEK_END);
-        void *map = mmap(NULL, fsize, PROT_READ, MAP_SHARED, fd, 0);
-        if (map == MAP_FAILED) { perror("mmap"); close(fd); continue; }
-        madvise(map, fsize, MADV_SEQUENTIAL);
-        files[active_files].fd = fd;
-        files[active_files].map = (Record*)map;
-        files[active_files].num_records = fsize / packed_size;
-        active_files++;
+        ins[i] = fopen(tmpfile, "rb");
+        if (!ins[i]) { perror("fopen"); exit(1); }
     }
 
-    if (active_files == 0) { close(fd_out); return; }
+    FILE *out = fopen(cfg.file_final, "wb");
+    if (!out) { perror("fopen"); exit(1); }
 
-    Node *heap = malloc(active_files * sizeof(Node));
+    HeapEntry heap[num_files];
     int heap_size = 0;
-
-    uint64_t *pointers = calloc(active_files, sizeof(uint64_t));
-    for (int i = 0; i < active_files; i++) {
-        if (pointers[i] < files[i].num_records) {
-            Record *packed_rec = &files[i].map[pointers[i]];
-            memcpy(heap[heap_size].rec.hash, packed_rec->hash, HASH_SIZE - cfg.compression);
-            memset(heap[heap_size].rec.hash + HASH_SIZE - cfg.compression, 0, cfg.compression);
-            memcpy(heap[heap_size].rec.nonce, packed_rec->nonce, NONCE_SIZE);
-            heap[heap_size].src = i;
+    for (int i = 0; i < num_files; i++) {
+        if (fread(&heap[heap_size].rec, RECORD_SIZE, 1, ins[i]) == 1) {
+            heap[heap_size].file_index = i;
             heap_size++;
         }
     }
 
-    for (int i = heap_size / 2 - 1; i >= 0; i--) {
-        int cur = i;
-        while (1) {
-            int l = 2 * cur + 1;
-            int r = l + 1;
-            int smallest = cur;
-            if (l < heap_size && node_less(&heap[l], &heap[smallest])) smallest = l;
-            if (r < heap_size && node_less(&heap[r], &heap[smallest])) smallest = r;
-            if (smallest == cur) break;
-            heap_swap(&heap[cur], &heap[smallest]);
-            cur = smallest;
-        }
-    }
-
     uint64_t written_bytes = 0;
-    uint64_t file_size = total_records * packed_size;
-    char *out_buf = malloc(1 << 24); // 16MB
-    char *out_ptr = out_buf;
-    size_t out_capacity = 1 << 24;
+    uint64_t file_size = total_records * RECORD_SIZE;
     while (heap_size > 0) {
-        Node min = heap[0];
-        memcpy(out_ptr, min.rec.hash, HASH_SIZE - cfg.compression);
-        memcpy(out_ptr + HASH_SIZE - cfg.compression, min.rec.nonce, NONCE_SIZE);
-        out_ptr += packed_size;
-        written_bytes += packed_size;
-        if (out_ptr - out_buf >= (ptrdiff_t)out_capacity - packed_size) {
-            off_t off = lseek(fd_out, 0, SEEK_END);
-            safe_pwrite_all(fd_out, out_buf, out_ptr - out_buf, off);
-            out_ptr = out_buf;
+        int min_idx = 0;
+        for (int i = 1; i < heap_size; i++) {
+            if (record_cmp(&heap[i].rec, &heap[min_idx].rec) < 0) min_idx = i;
         }
+        HeapEntry min_entry = heap[min_idx];
+        fwrite(&min_entry.rec, RECORD_SIZE, 1, out);
+        written_bytes += RECORD_SIZE;
 
         if (written_bytes % (file_size / 4) == 0) {
             double now = get_time();
@@ -291,48 +234,23 @@ void merge_chunks() {
             printf("[%.2f] Shuffle %.2f%%: %.2f MB/s\n", now - global_t0, pct, mb_s);
         }
 
-        int src = min.src;
-        pointers[src]++;
-        if (pointers[src] < files[src].num_records) {
-            Record *packed_rec = &files[src].map[pointers[src]];
-            memcpy(heap[0].rec.hash, packed_rec->hash, HASH_SIZE - cfg.compression);
-            memset(heap[0].rec.hash + HASH_SIZE - cfg.compression, 0, cfg.compression);
-            memcpy(heap[0].rec.nonce, packed_rec->nonce, NONCE_SIZE);
-            heap[0].src = src;
+        if (fread(&heap[min_idx].rec, RECORD_SIZE, 1, ins[min_entry.file_index]) == 1) {
+            heap[min_idx].file_index = min_entry.file_index;
         } else {
-            heap[0] = heap[--heap_size];
-        }
-
-        int cur = 0;
-        while (1) {
-            int l = 2 * cur + 1;
-            int r = l + 1;
-            int smallest = cur;
-            if (l < heap_size && node_less(&heap[l], &heap[smallest])) smallest = l;
-            if (r < heap_size && node_less(&heap[r], &heap[smallest])) smallest = r;
-            if (smallest == cur) break;
-            heap_swap(&heap[cur], &heap[smallest]);
-            cur = smallest;
+            heap[min_idx] = heap[heap_size - 1];
+            heap_size--;
         }
     }
 
-    if (out_ptr > out_buf) {
-        off_t off = lseek(fd_out, 0, SEEK_END);
-        safe_pwrite_all(fd_out, out_buf, out_ptr - out_buf, off);
-    }
+    for (int i = 0; i < num_files; i++) fclose(ins[i]);
+    fclose(out);
 
-    for (int i = 0; i < active_files; i++) {
-        munmap(files[i].map, files[i].num_records * packed_size);
-        close(files[i].fd);
+    for (int i = 0; i < num_files; i++) {
         char tmpfile[256];
         snprintf(tmpfile, sizeof(tmpfile), "%s.%" PRIu64, cfg.file_temp, (uint64_t)i);
         remove(tmpfile);
     }
-
-    free(heap);
-    free(pointers);
-    free(out_buf);
-    close(fd_out);
+    printf("File '%s' removed successfully.\n", cfg.file_temp);
 }
 
 void mode_generate() {
@@ -348,15 +266,15 @@ void mode_generate() {
         printf("Selected Approach           : %s\n", cfg.approach);
         printf("Number of Threads           : %d\n", cfg.threads);
         printf("Exponent K                  : %d\n", cfg.k);
-        printf("File Size (GB)              : %.2f\n", (double)total_records * (HASH_SIZE - cfg.compression + NONCE_SIZE) / (1ULL << 30));
-        printf("File Size (bytes)           : %" PRIu64 "\n", total_records * (HASH_SIZE - cfg.compression + NONCE_SIZE));
+        printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL << 30));
+        printf("File Size (bytes)           : %" PRIu64 "\n", total_records * RECORD_SIZE);
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
         printf("Memory Size (bytes)         : %" PRIu64 "\n", mem_bytes);
         printf("Number of Hashes (RAM)      : %" PRIu64 "\n", chunk_size);
         printf("Number of Hashes (Disk)     : %" PRIu64 "\n", total_records);
-        printf("Size of HASH                : %d\n", HASH_SIZE - cfg.compression);
+        printf("Size of HASH                : %d\n", HASH_SIZE);
         printf("Size of NONCE               : %d\n", NONCE_SIZE);
-        printf("Size of MemoRecord          : %d\n", HASH_SIZE - cfg.compression + NONCE_SIZE);
+        printf("Size of MemoRecord          : %d\n", RECORD_SIZE);
         printf("Rounds                      : %" PRIu64 "\n", rounds);
         printf("Number of Buckets           : %" PRIu64 "\n", NUM_BUCKETS);
         printf("Number of Records in Bucket : %" PRIu64 "\n", bucket_size);
@@ -377,7 +295,7 @@ void mode_generate() {
             double now = get_time();
             double pct = (r + 1.0) / rounds * 100;
             double mh = (double)count / (now - t0) / 1e6;
-            double mb = (double)count * (HASH_SIZE - cfg.compression + NONCE_SIZE) / (now - t0) / 1048576.0;
+            double mb = (double)count * RECORD_SIZE / (now - t0) / 1048576.0;
             printf("[%.2f] HashGen %.2f%%: %.2f MH/s : I/O %.2f MB/s\n", now - t0, pct, mh, mb);
         }
     }
@@ -386,7 +304,7 @@ void mode_generate() {
 
     double total_time = get_time() - t0;
     double total_mh = (double)total_records / total_time / 1e6;
-    double total_mb = (double)total_records * (HASH_SIZE - cfg.compression + NONCE_SIZE) / total_time / 1048576.0;
+    double total_mb = (double)total_records * RECORD_SIZE / total_time / 1048576.0;
     printf("Total Throughput: %.2f MH/s  %.2f MB/s\n", total_mh, total_mb);
     printf("Total Time: %.6f seconds\n", total_time);
 }
@@ -404,40 +322,29 @@ void mode_verify(const char *filename) {
 
     double t0 = get_time();
     uint64_t sorted = 0, not_sorted = 0, zero_nonces = 0, total_rec = 0;
-    int packed_size = HASH_SIZE - cfg.compression + NONCE_SIZE;
-    char *prev_packed = malloc(packed_size);
-    char *curr_packed = malloc(packed_size);
+    Record prev, r;
     int first = 1;
-    while (fread(curr_packed, packed_size, 1, f) == 1) {
+    while (fread(&r, RECORD_SIZE, 1, f) == 1) {
         total_rec++;
-        uint8_t *nonce = (uint8_t*)(curr_packed + HASH_SIZE - cfg.compression);
-        if (is_zero_nonce(nonce)) {
+        if (is_zero_nonce(r.nonce)) {
             zero_nonces++;
         } else {
             if (!first) {
-                uint8_t prev_hash[HASH_SIZE];
-                uint8_t curr_hash[HASH_SIZE];
-                memcpy(prev_hash, prev_packed, HASH_SIZE - cfg.compression);
-                memset(prev_hash + HASH_SIZE - cfg.compression, 0, cfg.compression);
-                memcpy(curr_hash, curr_packed, HASH_SIZE - cfg.compression);
-                memset(curr_hash + HASH_SIZE - cfg.compression, 0, cfg.compression);
-                if (compare_hash_bytes(prev_hash, curr_hash) > 0) not_sorted++;
+                if (record_cmp(&prev, &r) > 0) not_sorted++;
             }
             sorted++;
-            memcpy(prev_packed, curr_packed, packed_size);
+            prev = r;
             first = 0;
         }
 
         if (total_rec % (total_records / 4) == 0 && total_rec > 0) {
             double now = get_time();
             double pct = (double)total_rec / total_records * 100;
-            double mb = (double)total_rec * packed_size / (now - t0) / 1048576.0;
+            double mb = (double)total_rec * RECORD_SIZE / (now - t0) / 1048576.0;
             printf("[%.2f] Verify %.2f%%: %.2f MB/s\n", now - t0, pct, mb);
         }
     }
     fclose(f);
-    free(prev_packed);
-    free(curr_packed);
 
     printf("sorted=%" PRIu64 " not_sorted=%" PRIu64 " zero_nonces=%" PRIu64 " total_records=%" PRIu64 "\n", sorted, not_sorted, zero_nonces, total_rec);
 }
@@ -445,34 +352,30 @@ void mode_verify(const char *filename) {
 void mode_print(const char *filename, int n) {
     FILE *f = fopen(filename, "rb");
     if (!f) { perror("fopen"); exit(1); }
-    int packed_size = HASH_SIZE - cfg.compression + NONCE_SIZE;
-    char *packed = malloc(packed_size);
-    for (int i = 0; i < n && fread(packed, packed_size, 1, f); i++) {
-        printf("[%d] stored: ", i * packed_size);
-        uint8_t *nonce = (uint8_t*)(packed + HASH_SIZE - cfg.compression);
-        if (is_zero_nonce(nonce)) {
-            printf("BLANK nonce: BLANK\n");
-        } else {
-            print_hex((uint8_t*)packed, HASH_SIZE - cfg.compression);
-            printf(" nonce: %" PRIu64 "\n", nonce_to_u64(nonce));
+    Record r;
+    for (int i = 0; i < n && fread(&r, RECORD_SIZE, 1, f); i++) {
+        printf("[%d] stored: ", i * RECORD_SIZE);
+        if (is_zero_nonce(r.nonce)) printf("BLANK nonce: BLANK\n");
+        else {
+            print_hex(r.hash, HASH_SIZE);
+            printf(" nonce: %" PRIu64 "\n", nonce_to_u64(r.nonce));
         }
     }
     fclose(f);
-    free(packed);
 }
 
 void mode_search(const char *filename) {
     printf("searches=%d difficulty=%d\n", cfg.search_num, cfg.difficulty);
     printf("Parsed k                     : %d\n", cfg.k);
     printf("Nonce Size                   : %d\n", NONCE_SIZE);
-    printf("Record Size                  : %d\n", RECORD_SIZE - cfg.compression);
-    printf("Hash Size                    : %d\n", HASH_SIZE - cfg.compression);
-    printf("On-disk Record Size          : %d\n", RECORD_SIZE - cfg.compression);
-    printf("Number of Buckets            : %" PRIu64 "\n", (1ULL << 24));
-    printf("Number of Records in Bucket  : %" PRIu64 "\n", (1ULL << (cfg.k - 24)));
+    printf("Record Size                  : %d\n", RECORD_SIZE);
+    printf("Hash Size                    : %d\n", HASH_SIZE);
+    printf("On-disk Record Size          : %d\n", RECORD_SIZE);
+    printf("Number of Buckets            : %" PRIu64 "\n", NUM_BUCKETS);
+    printf("Number of Records in Bucket  : %" PRIu64 "\n", bucket_size);
     printf("Number of Hashes      : %" PRIu64 "\n", total_records);
-    printf("File Size to be read (bytes) : %" PRIu64 "\n", total_records * (RECORD_SIZE - cfg.compression));
-    printf("File Size to be read (GB)    : %.6f\n", (double)total_records * (RECORD_SIZE - cfg.compression) / (1ULL << 30));
+    printf("File Size to be read (bytes) : %" PRIu64 "\n", total_records * RECORD_SIZE);
+    printf("File Size to be read (GB)    : %.6f\n", (double)total_records * RECORD_SIZE / (1ULL << 30));
 
     struct stat st;
     if (stat(filename, &st) == 0) {
@@ -490,8 +393,6 @@ void mode_search(const char *filename) {
     int found_queries = 0;
     int notfound = 0;
 
-    int packed_size = RECORD_SIZE - cfg.compression;
-    char *packed = malloc(packed_size);
     for (int i = 0; i < cfg.search_num; i++) {
         uint8_t prefix[HASH_SIZE] = {0};
         for (int j = 0; j < cfg.difficulty; j++) prefix[j] = rand() % 256;
@@ -503,24 +404,20 @@ void mode_search(const char *filename) {
             prefix_val = (prefix_val << 8) | prefix[j];
         }
         uint64_t start_index = prefix_val * total_records >> (cfg.difficulty * 8);
-        off_t byte_off = start_index * packed_size;
+        off_t byte_off = start_index * RECORD_SIZE;
         fseek(f, byte_off, SEEK_SET);
 
         int comps = 0;
         int matches = 0;
-        while (fread(packed, packed_size, 1, f) == 1) {
-            uint8_t hash[HASH_SIZE];
-            memcpy(hash, packed, HASH_SIZE - cfg.compression);
-            memset(hash + HASH_SIZE - cfg.compression, 0, cfg.compression);
-            uint8_t *nonce = (uint8_t*)(packed + HASH_SIZE - cfg.compression);
-
+        Record r;
+        while (fread(&r, RECORD_SIZE, 1, f) == 1) {
             comps++;
-            if (memcmp(hash, prefix, cfg.difficulty) != 0) break;
+            if (memcmp(r.hash, prefix, cfg.difficulty) != 0) break;
             matches++;
             if (cfg.debug) {
-                printf("[%d] MATCH ", i);
-                print_hex(hash, HASH_SIZE);
-                printf(" %" PRIu64 " time=%.3f ms comps=%d\n", nonce_to_u64(nonce), (get_time() - t0) * 1000, comps);
+                printf("MATCH ");
+                print_hex(r.hash, HASH_SIZE);
+                printf(" %" PRIu64 " time=%.3f ms comps=%d\n", nonce_to_u64(r.nonce), (get_time() - t0) * 1000, comps);
             }
         }
 
@@ -539,7 +436,6 @@ void mode_search(const char *filename) {
         else notfound++;
     }
     fclose(f);
-    free(packed);
 
     double avg_ms = total_time * 1000 / cfg.search_num;
     double searches_per_sec = cfg.search_num / total_time;
@@ -563,13 +459,13 @@ static void record_swap(Record *a, Record *b) {
 }
 
 static void parallel_qsort_records(Record *a, size_t n) {
-    const size_t threshold = 1 << 16; // 65536
-
-    if (n < threshold) {
+    const size_t SERIAL_THRESHOLD = 1024; // use serial qsort for small arrays
+    if (n <= SERIAL_THRESHOLD) {
         qsort(a, n, sizeof(Record), record_cmp);
         return;
     }
 
+    // Median of three pivot selection
     Record *p1 = &a[0], *p2 = &a[n/2], *p3 = &a[n-1];
     if (record_cmp(p1, p2) > 0) record_swap(p1, p2);
     if (record_cmp(p1, p3) > 0) record_swap(p1, p3);
@@ -646,7 +542,7 @@ int main(int argc, char *argv[]) {
             case 'v': cfg.verify = !strcmp(optarg, "true"); break;
             case 'h':
                 printf("Usage: ./vaultx [OPTIONS]\n");
-                // print usage as in homework
+                // print usage
                 return 0;
         }
     }
@@ -664,16 +560,4 @@ int main(int argc, char *argv[]) {
     }
 
     return 0;
-}
-
-static int node_less(const Node *x, const Node *y) {
-    int cmp = compare_hash_bytes(x->rec.hash, y->rec.hash);
-    if (cmp != 0) return cmp < 0;
-    return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
-}
-
-static void heap_swap(Node *a, Node *b) {
-    Node t = *a;
-    *a = *b;
-    *b = t;
 }
