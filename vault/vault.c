@@ -304,7 +304,9 @@ void merge_chunks() {
     }
 
     /* heap node and helpers already exist at file scope: Node, heap_swap, node_less */
-    Node *heap = malloc(nfiles * sizeof(Node));
+
+    Node *heap = malloc((size_t)nfiles * sizeof(Node));
+
     int heap_sz = 0;
 
     /* push initial record from each file (from buffer) */
