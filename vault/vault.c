@@ -609,7 +609,7 @@ int main(int argc, char *argv[]) {
                        " -q, --difficulty Set difficulty for search in bytes\n"
                        " -h, --help Display this help message\n\n"
                        "Example:\n"
-                       " ./vaultx -t 24 -i 1 -m 1024 -k 26 -g memo.t -f memo.x -d true\n");
+                       " ./vaultx -t 24 -i 1 -m 256 -k 26 -g memo.t -f k26-memo.x -d true\n");
                 return 0;
                 return 0;
         }
