@@ -203,16 +203,17 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
 
     /* write chunk to the temporary file (not directly to final) */
     double tw0 = get_time();
-    int fd = open(tmpfile, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) { perror("open tmpfile"); free(buf); exit(1); }
-    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), 0);
+    /* write directly into final file at the correct offset */
+    int fd = open(cfg.file_final, O_WRONLY);
+    if (fd < 0) { perror("open final for chunk write"); free(buf); exit(1); }
+    off_t off = (off_t)start * (off_t)sizeof(Record);
+    ssize_t wrote = safe_pwrite_all(fd, buf, count * sizeof(Record), off);
     if (wrote < 0) {
-        perror("pwrite tmpfile");
+        perror("pwrite final");
         close(fd); free(buf); exit(1);
     }
     close(fd);
     double tw1 = get_time();
-
     free(buf);
     double t1 = get_time();
 
@@ -411,10 +412,19 @@ void mode_generate() {
         printf("Exponent K                  : %d\n", cfg.k);
         printf("File Size (GB)              : %.2f\n", (double)total_records * RECORD_SIZE / (1ULL<<30));
         printf("Memory Size (MB)            : %d\n", cfg.memory_mb);
-    printf("Rounds                      : %" PRIu64 "\n", rounds);
+        printf("Rounds                      : %" PRIu64 "\n", rounds);
         printf("Temporary File              : %s\n", cfg.file_temp);
         printf("Final Output File           : %s\n", cfg.file_final);
     }
+
+    /* PREALLOCATE final file so per-chunk pwrite doesn't race with truncation */
+    int fd_pre = open(cfg.file_final, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd_pre < 0) { perror("open final for prealloc"); exit(1); }
+    if (ftruncate(fd_pre, (off_t)(total_records * sizeof(Record))) != 0) {
+        perror("ftruncate final");
+        /* not fatal, proceed */
+    }
+    close(fd_pre);
 
     double t0 = get_time();
     for (uint64_t r = 0; r < rounds; r++) {
