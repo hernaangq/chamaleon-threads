@@ -435,7 +435,7 @@ void mode_generate() {
         generate_chunk(start, count, tmpfile);
     }
 
-    merge_chunks();
+    /* merge_chunks() skipped because we write chunks directly into the final file with pwrite */
 
     double total_time = get_time() - t0;
     double mh = total_records / total_time / 1e6;
