@@ -70,56 +70,43 @@ void generate_hash(uint64_t nonce_val, Record *rec) {
     blake3_hasher_finalize(&hasher, rec->hash, HASH_SIZE);
 }
 
+/* fast lexicographic compare for 10-byte hashes:
+   compare first 8 bytes as big-endian uint64, then remaining 2 bytes as big-endian uint16 */
+static inline uint64_t be_u64(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    v = __builtin_bswap64(v);
+#endif
+    return v;
+}
+static inline uint16_t be_u16(const uint8_t *p) {
+    uint16_t v;
+    memcpy(&v, p, 2);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+    v = (uint16_t)((v << 8) | (v >> 8));
+#endif
+    return v;
+}
+
+/* returns -1,0,1 like memcmp on HASH_SIZE bytes */
+static inline int compare_hash_bytes(const uint8_t *a, const uint8_t *b) {
+    uint64_t va = be_u64(a);
+    uint64_t vb = be_u64(b);
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    uint16_t sa = be_u16(a + 8);
+    uint16_t sb = be_u16(b + 8);
+    if (sa < sb) return -1;
+    if (sa > sb) return 1;
+    return 0;
+}
+
+/* record compare used by qsort */
 int record_cmp(const void *a, const void *b) {
-    return memcmp(((Record*)a)->hash, ((Record*)b)->hash, HASH_SIZE);
-}
-
-static void record_swap(Record *a, Record *b) {
-    Record t = *a; *a = *b; *b = t;
-}
-
-static void parallel_qsort_records(Record *a, size_t n) {
-    const size_t SERIAL_THRESHOLD = 1024;     /* use serial qsort for small arrays */
-    const size_t TASK_THRESHOLD   = 1 << 14;  /* only spawn tasks for large partitions */
-
-    if (n <= SERIAL_THRESHOLD) {
-        qsort(a, n, sizeof(Record), record_cmp);
-        return;
-    }
-
-    /* choose pivot (middle) and partition */
-    Record pivot = a[n / 2];
-    size_t i = 0, j = n - 1;
-    while (i <= j) {
-        while (record_cmp(&a[i], &pivot) < 0) i++;
-        while (record_cmp(&a[j], &pivot) > 0) {
-            if (j == 0) break; /* defensive */
-            j--;
-        }
-        if (i <= j) {
-            if (i != j) record_swap(&a[i], &a[j]);
-            i++; if (j == 0) break; j--;
-        }
-    }
-
-    /* recurse in parallel via OpenMP tasks */
-    if (j + 1 > 0) {
-        if (n > TASK_THRESHOLD) {
-            #pragma omp task firstprivate(a, j)
-            parallel_qsort_records(a, j + 1);
-        } else {
-            parallel_qsort_records(a, j + 1);
-        }
-    }
-    if (n > i) {
-        if (n > TASK_THRESHOLD) {
-            #pragma omp task firstprivate(a, i, n)
-            parallel_qsort_records(a + i, n - i);
-        } else {
-            parallel_qsort_records(a + i, n - i);
-        }
-    }
-    #pragma omp taskwait
+    const Record *ra = (const Record*)a;
+    const Record *rb = (const Record*)b;
+    return compare_hash_bytes(ra->hash, rb->hash);
 }
 
 /* ---------- I/O Worker ---------- */
@@ -242,8 +229,9 @@ static void heap_swap(Node *a, Node *b) {
 
 /* compare by hash then nonce (file-scope) */
 static int node_less(const Node *x, const Node *y) {
-    int cmp = memcmp(x->rec.hash, y->rec.hash, HASH_SIZE);
+    int cmp = compare_hash_bytes(x->rec.hash, y->rec.hash);
     if (cmp != 0) return cmp < 0;
+    /* tie-break by nonce lexicographically (6 bytes) */
     return memcmp(x->rec.nonce, y->rec.nonce, NONCE_SIZE) < 0;
 }
 
