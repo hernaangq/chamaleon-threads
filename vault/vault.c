@@ -200,7 +200,7 @@ void generate_chunk(uint64_t start, uint64_t count, const char *tmpfile) {
 
 void merge_chunks() {
     double global_t0 = get_time();
-    double shuffle_t0 = get_time;
+    double shuffle_t0 = get_time();
     int num_files = (int)rounds;
     FILE *ins[num_files];
     for (int i = 0; i < num_files; i++) {
@@ -481,11 +481,14 @@ static void parallel_qsort_records(Record *a, size_t n) {
     size_t i = 0, j = n - 1;
     while (i <= j) {
         while (record_cmp(&a[i], &pivot) < 0) i++;
-        while (record_cmp(&a[j], &pivot) > 0) j--;
+        while (record_cmp(&a[j], &pivot) > 0) {
+            if (j == 0) break;
+            j--;
+        }
         if (i <= j) {
             record_swap(&a[i], &a[j]);
             i++;
-            if (j == 0) break; // prevent underflow
+            if (j == 0) break;
             j--;
         }
     }
