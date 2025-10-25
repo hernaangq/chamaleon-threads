@@ -444,7 +444,7 @@ cleanup:
     close(fd_out);
 
     double m1 = get_time();
-    if (cfg.debug) fprintf(stderr, "merge time=%.3f s\n", m1 - m0);
+    if (cfg.debug) fprintf(stderr, "Merge Time                  : %.3f s\n", m1 - m0);
 }
 
 /* ---------- Generate Mode ---------- */
