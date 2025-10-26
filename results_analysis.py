@@ -8,10 +8,11 @@ import queries
 df = pd.read_csv('results.csv', header=0)
 
 #Separate Hash Generation - small results
-hash_gen_sm_df = df[df["k"] == 26]
+hash_gen_sm_df = df[(df["test_type"] == "hashGen") & (df["k"] == 26)]
 #Separate Hash Generation - large results
-hash_gen_lg_df = df[df["k"] == 32]
-
+hash_gen_lg_df = df[(df["test_type"] == "hashGen") & (df["k"] == 32)]
+#Separate Search Results
+hash_srch_df = df[df["record_size"] == "hashSearch"]
 
 #Analysis
 #Hash Generation - Small (k=26)
@@ -20,7 +21,12 @@ result_df_hash_gen_sm = sqldf(queries.query_hash_gen_sm, globals()) # or locals(
 
 #Hash Generation - Large (k=32)
 result_df_hash_gen_lg = sqldf(queries.query_hash_gen_lg, globals()) # or locals()
-print(result_df_hash_gen_lg)
+#print(result_df_hash_gen_lg)
+
+#Search Results
+result_df_hash_srch = sqldf(queries.query_hash_search, globals()) # or locals()
+print(result_df_hash_srch)
+
 
 #Plots
 
@@ -75,7 +81,3 @@ plt.grid(True, linestyle="--", alpha=0.6)
 plt.legend()
 plt.tight_layout()
 plt.show()
-
-
-
-
