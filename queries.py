@@ -59,3 +59,18 @@ SELECT data.*,
         CASE WHEN min.abs_min = data.best_time then 'Y' else 'N' END AS abs_best 
 FROM data, min
 """
+
+query_hash_search = """
+SELECT df.approach k,
+        df.threads difficulty,
+        df.iothreads no_searches,
+        df.k avg_seeks,
+        df.mem_mb avg_data_read,
+        df.rounds total_time,
+        df.tmpfile avg_ms,
+        df.finalfile throughput,
+        df.compression found,
+        df.eff_hash not_found
+FROM hash_srch_df df 
+ORDER BY 1, 2
+"""
