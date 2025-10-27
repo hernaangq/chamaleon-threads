@@ -256,8 +256,13 @@ void merge_chunks() {
     if (fd_out < 0) { perror("open final"); exit(1); }
 
     /* open all tmp files */
-    FILE **fps = calloc(rounds, sizeof(FILE*));
-    int *indices = calloc(rounds, sizeof(int));
+    /* guard against multiplication overflow when sizing allocations */
+    if (rounds > (SIZE_MAX / sizeof(FILE*))) { fprintf(stderr, "rounds too large\n"); close(fd_out); exit(1); }
+    FILE **fps = calloc((size_t)rounds, sizeof(FILE*));
+    if (!fps) { perror("calloc fps"); close(fd_out); exit(1); }
+    if (rounds > (SIZE_MAX / sizeof(int))) { fprintf(stderr, "rounds too large\n"); free(fps); close(fd_out); exit(1); }
+    int *indices = calloc((size_t)rounds, sizeof(int));
+    if (!indices) { perror("calloc indices"); free(fps); close(fd_out); exit(1); }
     int nfiles = 0;
     for (uint64_t r = 0; r < rounds; r++) {
         char tmpfile[256];
@@ -305,7 +310,10 @@ void merge_chunks() {
 
     /* heap node and helpers already exist at file scope: Node, heap_swap, node_less */
 
+    /* check for overflow and allocate heap */
+    if ((size_t)nfiles > (SIZE_MAX / sizeof(Node))) { fprintf(stderr, "too many tmp files\n"); goto cleanup; }
     Node *heap = malloc((size_t)nfiles * sizeof(Node));
+    if (!heap) { perror("malloc heap"); goto cleanup; }
 
     int heap_sz = 0;
 
